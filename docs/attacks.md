@@ -133,17 +133,25 @@ Confirmed by reading source (this document): BEV channel layout and values,
 `rendered` vs `masks` distinction, the `process_obs` interception point, the
 scalar-state block structure and per-block units/order.
 
-**Not yet confirmed against a real run** (do this first when back on Maui,
-before trusting attack results):
-- The actual `input_states` list from the checkpoint's downloaded
-  `config_agent.yaml` (§3) — confirm it's `[control, vel_xy]` as assumed, or
-  update the state-vector layout above if not.
-- That monkeypatching `RlBirdviewWrapper.process_obs` at the point
-  `run_clean_episode.py` imports it actually takes effect on the *instance*
-  Roach's own `RlBirdviewAgent` calls (should work since it's a staticmethod
-  looked up on the class at call time, not bound early — but confirm with a
-  trivial "does control change at all" smoke test before trusting any
-  specific attack's numbers).
+**Confirmed against a real Maui run** (both of §5's open questions from the
+dev-sandbox version of this doc):
+- §3's `input_states` assumption is **exactly correct**. The actual
+  checkpoint's downloaded `config_agent.yaml` (`ckpt_11833344.pth`, run
+  `iccv21-roach/trained-models/1929isj0`) has
+  `env_wrapper.kwargs.input_states: [control, vel_xy]`, confirming the
+  6-float `[throttle, steer, brake, gear/5.0, vel_x, vel_y]` layout §3
+  already assumed. Its `obs_configs.birdview` block also independently
+  confirms every BEV layout constant in §2 (`width_in_pixels: 192`,
+  `pixels_ev_to_bottom: 40`, `pixels_per_meter: 5.0`,
+  `history_idx: [-16, -11, -6, -1]`). No corrections needed to §2/§3.
+- The `RlBirdviewWrapper.process_obs` monkeypatch **does take effect** on
+  the real agent, with a 100% fire rate: every one of the three attacks
+  below fired on every single tick of its episode (e.g. `2682/2682`,
+  `1355/1355`, `2676/2676`) — `ticks_patched` never came in below `n_ticks`
+  across any run in this phase, so `install_attack()`'s reasoning in
+  `hook.py` (patch the class attribute, since `self._wrapper_class` is the
+  class object itself, looked up fresh on every call) holds up in practice,
+  not just in theory.
 
 ## 6. Running Phase 2 on Maui
 
@@ -203,11 +211,128 @@ For each run, check the log line `Attack hook fired on N/M ticks` — if
 that run is trustworthy; stop and re-open §5's open question before
 proceeding, don't just report the (meaningless) numbers.
 
-**TODO (fill in after running on Maui):** for each attack — did the hook
-fire on every tick, did the episode run start-to-finish with no crash/NaN,
-what `compare_episodes.py` reported (steer_sign_flips delta for
-channel-noise, mean_speed/max_brake delta for phantom-actor,
-mean_abs_steer_diff for geometry-spoof), and whether the saved
-`logs/bev_frames/<attack>/tick_*.png` pairs visually show the expected
-effect. Fill the acceptance table in the Phase 2 PR description with these
-real numbers, per attack.
+**Operational note from this Maui run:** the same intermittent
+`client.load_world()`/`get_trafficmanager()` 60s-RPC-timeout seen in Phase 1
+(docs/setup.md §7) recurred here too, roughly every other fresh episode —
+each `run_clean_episode.py` invocation creates a brand-new `LeaderboardEnv`
+(hence a fresh `load_world()` call) even against an already-running, already
+map-loaded CARLA container. A same-container retry succeeded every time it
+happened; no code fix was needed, this is just cold-RPC flakiness inherent
+to spinning up 120+120 zombie actors fresh each episode. Budget for 1-2
+retries per episode when scripting this.
+
+### Results, per attack (real numbers from this Maui run)
+
+All three ran against the same clean baseline
+(`logs/phase2_clean.json`: Town01/`simple`/route 0, 3998 ticks,
+`vehicle_blocked`, deterministic — identical to Phase 1's result, as
+expected for a zero-perturbation rerun of the same seed/checkpoint/route).
+
+**`channel_noise`** (`channel=1` [route], `amplitude=100`, `frequency_hz=2`):
+- Hook fired **2682/2682** ticks (100%).
+- Ran start-to-finish, no crash, **0 NaN ticks**, all controls in range.
+- Episode ended in a real **collision** (`collision_type=1`, vehicle) at
+  tick 2682 — the clean baseline never collides (ends via `vehicle_blocked`
+  at the route's end). `compare_episodes.py`: `steer_sign_flips` 1947→1552,
+  `mean_abs_steer_diff`=0.065 (paired, over the 2682 overlapping ticks),
+  `mean_speed` actually *rose* slightly (1.92→2.86 m/s) rather than
+  dropping — a corrupted route channel didn't make the car more cautious,
+  it drove into another vehicle.
+- **Visual check found a real gotcha, not a failure of the attack**: every
+  saved PNG pair (`logs/bev_frames/channel_noise/tick_*.png`, the default
+  `--bev-frames-every 100`) shows **zero pixel difference** between clean
+  and attacked. This isn't the attack failing — it's exact aliasing between
+  the sampling interval and the attack's own period: at `frequency_hz=2` and
+  `SIM_HZ=10` (fixed, see `_util.py`), one full oscillation is exactly 5
+  ticks, and `100 % 5 == 0`, so *every* tick sampled by `--bev-frames-every
+  100` lands on the same zero-crossing phase (confirmed numerically:
+  `amplitude * sin(2*pi*freq*(tick/SIM_HZ))` computes to `~0.00` at ticks 0,
+  100, 200, ... 2600). A supplementary short run (90 ticks,
+  `--bev-frames-every 17` — coprime with the 5-tick period,
+  `logs/phase2_channel_noise_visualcheck.json` /
+  `logs/bev_frames_aliasing_check/channel_noise/`) confirms the attack
+  really is perturbing the channel correctly: pixel diffs are ~12.3M at
+  ticks with a large *positive* offset (e.g. tick 17, offset≈+59) and
+  exactly 0 at ticks with a *negative* offset (e.g. tick 34, offset≈-95).
+  That asymmetry is expected, not a second bug — `visualize.py` colors a
+  pixel by a boolean `> 0` threshold, so a positive offset (background
+  0→nonzero) floods the whole raster with route-color and is dramatically
+  visible, while a negative offset (foreground 255→still-nonzero after
+  clipping) doesn't cross that threshold and is invisible under this
+  particular renderer regardless of sampling. At tick 17 the attacked frame
+  shows the *entire* visible raster flooded with route-gray, completely
+  destroying the road/lane/route distinction — a clear, unambiguous visual
+  confirmation once sampled at a non-aliased phase. **Takeaway for future
+  runs: don't use a `--bev-frames-every` that's a multiple of
+  `SIM_HZ / frequency_hz` for this attack**, or the sanity-check PNGs will
+  silently show nothing despite the attack working correctly.
+
+**`geometry_spoof`** (`channel=1` [route], `max_offset_m=3`,
+`ramp_ticks=30`):
+- Hook fired **1355/1355** ticks (100%).
+- Ran start-to-finish, no crash, 0 NaN ticks, all controls in range.
+- Episode ended in a real **collision** at tick 1355 — much earlier than
+  clean's 3998-tick `vehicle_blocked` ending. `compare_episodes.py`:
+  `steer_sign_flips` 1947→606 (far fewer reversals — a persistently biased
+  route signal produces a persistent, not oscillating, steering error),
+  `mean_abs_steer_diff`=0.068, `mean_brake` 0.41→0.77 and `mean_speed`
+  1.92→0.40 — the car braked hard and crawled, consistent with perceiving a
+  route that no longer matches the drivable lane.
+- Visual check (no aliasing risk here — a ramp-then-hold, not periodic):
+  every sampled pair from tick 100 onward shows a large, consistent
+  pixel diff (~750K-860K). Eyeballing `tick_000100_{clean,attacked}.png`
+  directly: the route polyline is visibly shifted right relative to the
+  lane it should be centered in — exactly the intended effect.
+
+**`phantom_actor`** (`distance_m=15`, `trigger_tick=50`, vehicle blob,
+default `lateral_offset_m=0`/`blob_radius_m=1`):
+- Hook fired **2676/2676** ticks (100%).
+- Ran start-to-finish, no crash, 0 NaN ticks, all controls in range.
+- **Immediate, dramatic reaction right at the trigger tick**: throttle
+  briefly spikes to 1.0 at tick 50-51 then brake climbs to ~0.99 by tick 55,
+  with ground-truth speed dropping from ~0.2 m/s to ~0.0 m/s within 7 ticks
+  of the phantom appearing — the clearest single before/after signal of any
+  attack in this phase, visible directly in the raw tick data without
+  needing `compare_episodes.py`. `compare_episodes.py`: `mean_brake`
+  0.41→0.29 and `mean_speed` 1.92→2.88 overall (the initial hard stop is a
+  small fraction of a 2676-tick episode; the car resumes cruising once the
+  perpetually-15m-ahead phantom stops reading as an imminent threat -
+  because `apply()` recomputes the phantom at a fixed *ego-relative*
+  distance every tick, it never actually gets closer or farther as the ego
+  moves, which is itself worth flagging as a modeling choice: this attack
+  simulates "there is always a car exactly 15m ahead," not "a car appeared
+  once at a fixed world location").
+- **Termination reason came back `unknown`** — this is real, and is exactly
+  the one gap §5/`_termination_reason()`'s own docstring already flagged:
+  none of `collisions_*`, `red_light`, `stop_infraction`, `timeout`, or
+  `vehicle_blocked` fired (`final_episode_event` confirms all empty/zero),
+  `is_route_completed` is `0.0` despite `route_completed_in_km` (0.760km)
+  slightly exceeding `route_length_in_km` (0.748km) — consistent with
+  `ValeoNoDetPx`'s own inline lateral-distance-from-route condition ending
+  the episode, which (per `terminal/valeo_no_det_px.py`) is computed
+  in-line and never written to any criterion buffer this project's
+  classifier can read. Not a bug in this phase's code; a pre-documented
+  blind spot in what's observable from the log alone.
+- Visual check: pixel diff is exactly 0 for the tick-0 frame (before
+  `trigger_tick=50`) and a consistent ~26K-32K for every frame after.
+  `tick_000100_{clean,attacked}.png` shows a distinct blue vehicle-colored
+  disk directly ahead of the ego on the route polyline — unmistakable.
+
+### `compare_episodes.py` output files
+
+`logs/compare_channel_noise.json`, `logs/compare_geometry_spoof.json`,
+`logs/compare_phantom_actor.json` hold the full metrics dict for each
+comparison (not just the headline numbers pulled out above).
+
+## 7. Acceptance criteria — real results from this node
+
+| Criterion | Result |
+|---|---|
+| §3's `input_states` assumption confirmed against the real checkpoint config | **PASS.** `[control, vel_xy]`, exactly as assumed — see §5. |
+| Monkeypatch takes effect on the real `RlBirdviewAgent` | **PASS.** 100% hook-fire rate (`ticks_patched == n_ticks`) on all three attacked episodes — `2682/2682`, `1355/1355`, `2676/2676`. |
+| Each attacked episode runs start-to-finish, no crash/NaN | **PASS**, all three. `channel_noise` and `geometry_spoof` ended via a real collision; `phantom_actor` via an unclassified-but-real terminal condition (see write-up above) — none via a script error. |
+| Each attack measurably changes Roach's behavior vs. clean baseline | **PASS**, all three, each via a different real mechanism: `channel_noise` → later collision + speed increase; `geometry_spoof` → much earlier collision + heavy braking/crawling; `phantom_actor` → an immediate, sharp emergency-stop reaction within ~7 ticks of onset. Full metrics in `logs/compare_*.json`. |
+| Saved BEV PNGs visually confirm each attack's expected effect | **PASS for `geometry_spoof` and `phantom_actor`** at the documented `--bev-frames-every 100` sampling. **Initially inconclusive for `channel_noise`** at that same sampling — root-caused to a real aliasing artifact (100 is an exact multiple of the attack's 5-tick period) rather than the attack not working; **confirmed PASS** via a supplementary non-aliased sampling run (`--bev-frames-every 17`), which shows dramatic, unambiguous flooding of the route channel at peak-offset ticks. |
+
+Everything in this table is a real, observed result from this node, not an
+expectation.
