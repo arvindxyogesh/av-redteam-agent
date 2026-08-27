@@ -356,6 +356,19 @@ def main() -> int:
                 warnings.extend(_check_control_sane(tick_idx, control))
 
                 events = _extract_events(info_dict[ACTOR_ID])
+                # agent.supervision_dict is set as a side effect of run_step()
+                # above, from the RAW (pre-attack) obs carla_gym produced -
+                # see rl_birdview_agent.py's run_step(): it reads
+                # input_data['speed']['forward_speed'] before process_obs()
+                # is ever called. So this is ground-truth ego speed,
+                # unaffected by whatever an attack did to the policy's
+                # *perceived* input - exactly what's needed to check
+                # whether an attack changed the car's actual behavior.
+                # forward_speed comes back as a length-1 np.float32 array
+                # (see actor_state/speed.py) - unwrap to a plain float so
+                # json.dumps doesn't have to fall back to str() on it.
+                _raw_speed = agent.supervision_dict.get("speed") if agent.supervision_dict else None
+                ground_truth_speed = float(_raw_speed[0]) if _raw_speed is not None else None
                 ticks.append(
                     {
                         "tick": tick_idx,
@@ -363,6 +376,7 @@ def main() -> int:
                         "steer": control.steer,
                         "throttle": control.throttle,
                         "brake": control.brake,
+                        "ground_truth_speed": ground_truth_speed,
                         "reward": reward_dict.get(ACTOR_ID),
                         "done": bool(done_dict.get(ACTOR_ID)),
                         "collision_events": events["collision"],
