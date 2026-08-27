@@ -253,28 +253,64 @@ def _check_control_sane(tick: int, control) -> list[str]:
     return warnings
 
 
-def main() -> int:
-    args = parse_args()
+def run_episode(
+    *,
+    roach_root: str,
+    host: str = "localhost",
+    port: int = 2000,
+    seed: int = 2021,
+    wb_run_path: str = "iccv21-roach/trained-models/1929isj0",
+    wb_ckpt_step=None,
+    carla_map: str = "Town01",
+    weather_group: str = "simple",
+    route_id: int = 0,
+    max_steps: int = 6000,
+    workdir=None,
+    attack_name: str = None,
+    attack_params: dict = None,
+    bev_frames_dir: str = "logs/bev_frames",
+    bev_frames_every: int = 0,
+    debug_dump_info: bool = False,
+) -> dict:
+    """Runs one episode (clean if attack_name is None, attacked otherwise)
+    and returns the raw log dict - the same {"meta": ..., "ticks": [...]}
+    structure the CLI (main(), below) writes to a file. This is the
+    function Phase 3's run_trial()/run_baseline() (avredteam_carla/runner.py)
+    call directly, in-process, so a search method (Phase 4) can invoke many
+    episodes in a loop without a subprocess per trial.
 
-    workdir = Path(args.workdir) if args.workdir else Path(tempfile.mkdtemp(prefix="roach_run_"))
+    Phase 3 adds three new ground-truth per-tick fields not present in
+    Phase 1/2 logs: lateral_offset_m, lane_half_width_m,
+    nearest_actor_distance_m (see docs/evaluator.md #3/#6 for exactly what
+    these are and why they're computed here rather than read from
+    info_dict). Everything else is unchanged from Phase 1/2's verified
+    behavior.
+    """
+    workdir = Path(workdir) if workdir else Path(tempfile.mkdtemp(prefix="roach_run_"))
     workdir.mkdir(parents=True, exist_ok=True)
     log.info("Using workdir (checkpoint/config downloads land here): %s", workdir)
 
     # Roach's modules (carla_gym, agents.*, reward.*, terminal.*) are not an
     # installed package - import them by adding the checkout to sys.path.
-    sys.path.insert(0, args.roach_root)
+    if roach_root not in sys.path:
+        sys.path.insert(0, roach_root)
 
     import gym
     import carla_gym  # noqa: F401  (side effect: registers LeaderBoard-v0 etc.)
     from agents.rl_birdview.rl_birdview_agent import RlBirdviewAgent
+    from avredteam_carla.ground_truth import (
+        compute_lateral_offset_m,
+        compute_lane_half_width_m,
+        compute_nearest_actor_distance_m,
+    )
 
     seed_cfg_path = workdir / "config_agent.yaml"
-    _write_seed_agent_config(seed_cfg_path, args.wb_run_path, args.wb_ckpt_step)
+    _write_seed_agent_config(seed_cfg_path, wb_run_path, wb_ckpt_step)
 
     prev_cwd = os.getcwd()
     os.chdir(workdir)  # wandb + RlBirdviewAgent download files relative to cwd
     try:
-        log.info("Loading Roach agent from %s (this downloads the checkpoint via wandb on first run)", args.wb_run_path)
+        log.info("Loading Roach agent from %s (this downloads the checkpoint via wandb on first run)", wb_run_path)
         agent = RlBirdviewAgent(path_to_conf_file=str(seed_cfg_path.name))
     finally:
         os.chdir(prev_cwd)
@@ -288,19 +324,19 @@ def main() -> int:
 
     log.info(
         "Creating LeaderBoard-v0 env: map=%s weather_group=%s host=%s port=%d",
-        args.carla_map, args.weather_group, args.host, args.port,
+        carla_map, weather_group, host, port,
     )
     env = gym.make(
         "LeaderBoard-v0",
         obs_configs=obs_configs,
         reward_configs=reward_configs,
         terminal_configs=terminal_configs,
-        carla_map=args.carla_map,
-        host=args.host,
-        port=args.port,
-        seed=args.seed,
+        carla_map=carla_map,
+        host=host,
+        port=port,
+        seed=seed,
         no_rendering=True,
-        weather_group=args.weather_group,
+        weather_group=weather_group,
         routes_group=None,
     )
 
@@ -310,26 +346,34 @@ def main() -> int:
 
     # Build the attack (if any) before entering the env context - keeps the
     # no-attack path from importing anything under avredteam_carla.attacks
-    # at all, so Phase 1's verified behavior is untouched when --attack is
-    # omitted.
+    # at all, so Phase 1's verified behavior is untouched when attack_name
+    # is None.
     attack = None
     attack_cm = _null_context()
-    if args.attack:
+    if attack_name:
         from avredteam_carla.attacks.registry import build_attack
         from avredteam_carla.attacks.hook import install_attack
 
-        attack_params = dict(_parse_attack_param(raw) for raw in args.attack_param)
-        attack = build_attack(args.attack, **attack_params)
+        attack = build_attack(attack_name, **(attack_params or {}))
         log.info("Attack active: %r", attack)
-        attack_cm = install_attack(attack, args.roach_root)
+        attack_cm = install_attack(attack, roach_root)
 
-    bev_frames_dir = Path(args.bev_frames_dir) / (args.attack or "none")
-    if args.attack and args.bev_frames_every > 0:
-        bev_frames_dir.mkdir(parents=True, exist_ok=True)
+    bev_frames_path = Path(bev_frames_dir) / (attack_name or "none")
+    if attack_name and bev_frames_every > 0:
+        bev_frames_path.mkdir(parents=True, exist_ok=True)
 
     try:
-        env.set_task_idx(args.route_id)  # pin an exact route deterministically, no shuffling
-        log.info("Pinned task_idx=%d (task=%s)", args.route_id, env.task)
+        env.set_task_idx(route_id)  # pin an exact route deterministically, no shuffling
+        log.info("Pinned task_idx=%d (task=%s)", route_id, env.task)
+
+        # Ground-truth accessors (docs/evaluator.md #3/#6): the real
+        # TaskVehicle (exposes .vehicle.get_location() and
+        # .get_route_transform()) and the real carla.Map/World, all
+        # independent of anything an attack does to the policy's perceived
+        # BEV input.
+        ego_task_vehicle = env._ev_handler.ego_vehicles[ACTOR_ID]
+        carla_map_obj = env._world.get_map()
+        ego_actor_id = ego_task_vehicle.vehicle.id
 
         with attack_cm as hook_handle:
             obs_dict = env.reset()
@@ -338,7 +382,7 @@ def main() -> int:
             tick_idx = 0
             final_episode_event = None
 
-            while not done_dict["__all__"] and tick_idx < args.max_steps:
+            while not done_dict["__all__"] and tick_idx < max_steps:
                 control = agent.run_step(obs_dict[ACTOR_ID], timestamp)
                 # No-attack path: control is applied exactly as Roach produced
                 # it (zero perturbation, per Phase 1). Attack path: control is
@@ -350,7 +394,7 @@ def main() -> int:
                 obs_dict, reward_dict, done_dict, info_dict = env.step(control_dict)
                 timestamp = env.timestamp
 
-                if args.debug_dump_info and tick_idx == 0:
+                if debug_dump_info and tick_idx == 0:
                     log.info("First tick raw info_dict[%s]: %s", ACTOR_ID, info_dict[ACTOR_ID])
 
                 warnings.extend(_check_control_sane(tick_idx, control))
@@ -369,6 +413,18 @@ def main() -> int:
                 # json.dumps doesn't have to fall back to str() on it.
                 _raw_speed = agent.supervision_dict.get("speed") if agent.supervision_dict else None
                 ground_truth_speed = float(_raw_speed[0]) if _raw_speed is not None else None
+
+                # Phase 3 ground-truth fields (docs/evaluator.md #3/#6) -
+                # real ego location vs. real route waypoint, real actor
+                # positions. Never touches the BEV raster or anything an
+                # attack could have perturbed.
+                ego_location = ego_task_vehicle.vehicle.get_location()
+                lateral_offset_m = compute_lateral_offset_m(ego_task_vehicle)
+                lane_half_width_m = compute_lane_half_width_m(carla_map_obj, ego_location)
+                nearest_actor_distance_m = compute_nearest_actor_distance_m(
+                    env._world, ego_location, ego_actor_id
+                )
+
                 ticks.append(
                     {
                         "tick": tick_idx,
@@ -377,6 +433,9 @@ def main() -> int:
                         "throttle": control.throttle,
                         "brake": control.brake,
                         "ground_truth_speed": ground_truth_speed,
+                        "lateral_offset_m": lateral_offset_m,
+                        "lane_half_width_m": lane_half_width_m,
+                        "nearest_actor_distance_m": nearest_actor_distance_m,
                         "reward": reward_dict.get(ACTOR_ID),
                         "done": bool(done_dict.get(ACTOR_ID)),
                         "collision_events": events["collision"],
@@ -385,12 +444,12 @@ def main() -> int:
                 )
 
                 if (
-                    args.attack
-                    and args.bev_frames_every > 0
-                    and tick_idx % args.bev_frames_every == 0
+                    attack_name
+                    and bev_frames_every > 0
+                    and tick_idx % bev_frames_every == 0
                     and hook_handle.last_attacked_birdview is not None
                 ):
-                    _save_bev_frame_pair(hook_handle, bev_frames_dir, tick_idx)
+                    _save_bev_frame_pair(hook_handle, bev_frames_path, tick_idx)
 
                 if done_dict.get(ACTOR_ID):
                     final_episode_event = info_dict[ACTOR_ID].get("episode_event", {})
@@ -398,12 +457,12 @@ def main() -> int:
 
                 tick_idx += 1
 
-            if tick_idx >= args.max_steps and not done_dict["__all__"]:
+            if tick_idx >= max_steps and not done_dict["__all__"]:
                 termination_reason = "max_steps_reached"
 
             final_stat = info_dict[ACTOR_ID].get("episode_stat") if ticks else None
 
-            if args.attack:
+            if attack_name:
                 if hook_handle.ticks_patched == 0:
                     log.warning(
                         "Attack hook never fired (ticks_patched=0) - the monkeypatch may not be "
@@ -413,18 +472,18 @@ def main() -> int:
                     log.info("Attack hook fired on %d/%d ticks", hook_handle.ticks_patched, len(ticks))
 
     finally:
-        # Always clean up actors/world state, even on failure.
+        # Always clean up actors/world state, even on failure. This is what
+        # Step 4's repeated-run_trial-calls test (tests/test_runner.py on
+        # Maui - see docs/evaluator.md) depends on not leaking.
         log.info("Closing env (destroys ego + zombie actors, resets world settings)")
         env.close()
 
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    result = {
+    return {
         "meta": {
-            "carla_map": args.carla_map,
-            "weather_group": args.weather_group,
-            "route_id": args.route_id,
-            "wb_run_path": args.wb_run_path,
+            "carla_map": carla_map,
+            "weather_group": weather_group,
+            "route_id": route_id,
+            "wb_run_path": wb_run_path,
             "n_ticks": len(ticks),
             "termination_reason": termination_reason,
             "sanity_warnings": warnings,
@@ -432,13 +491,45 @@ def main() -> int:
             "final_episode_event": final_episode_event,
             "run_timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "attack": (
-                {"name": args.attack, "params": attack.param_summary()}
+                {"name": attack_name, "params": attack.param_summary()}
                 if attack is not None
                 else None
             ),
         },
         "ticks": ticks,
     }
+
+
+def main() -> int:
+    args = parse_args()
+
+    attack_params = dict(_parse_attack_param(raw) for raw in args.attack_param) if args.attack else None
+
+    result = run_episode(
+        roach_root=args.roach_root,
+        host=args.host,
+        port=args.port,
+        seed=args.seed,
+        wb_run_path=args.wb_run_path,
+        wb_ckpt_step=args.wb_ckpt_step,
+        carla_map=args.carla_map,
+        weather_group=args.weather_group,
+        route_id=args.route_id,
+        max_steps=args.max_steps,
+        workdir=args.workdir,
+        attack_name=args.attack,
+        attack_params=attack_params,
+        bev_frames_dir=args.bev_frames_dir,
+        bev_frames_every=args.bev_frames_every,
+        debug_dump_info=args.debug_dump_info,
+    )
+
+    ticks = result["ticks"]
+    warnings = result["meta"]["sanity_warnings"]
+    termination_reason = result["meta"]["termination_reason"]
+
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
     if out_path.suffix == ".csv":
         with out_path.open("w", newline="") as f:
