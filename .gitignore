@@ -1,0 +1,41 @@
+# --- Large / binary artifacts: never commit these ---
+
+# CARLA server package (multi-GB)
+/CARLA_*/
+/carla-server/
+/AdditionalMaps_*.tar.gz
+CARLA_*.tar.gz
+*.egg
+*.whl
+
+# Roach checkout + checkpoints (cloned/downloaded per docs/setup.md, not vendored)
+/roach/
+/carla-roach/
+*.ckpt
+config_agent.yaml
+wandb/
+
+# conda/micromamba envs and package caches
+/envs/
+/pkgs/
+/.conda/
+/.mamba/
+
+# run outputs / logs (generated, not source)
+/logs/*
+!/logs/.gitkeep
+outputs/
+*.h5
+*.mp4
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+*.swp
