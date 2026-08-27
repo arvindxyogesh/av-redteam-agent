@@ -138,3 +138,51 @@ that's Phase 4. No formal evaluator/severity scoring — that's Phase 3.
   filled in with real Maui results. Do not merge without review.
 - Don't bulk-commit BEV frame PNGs — `.gitignore` already excludes
   `logs/` (where `--bev-frames-every` writes them) except `.gitkeep`.
+
+---
+
+# Phase 3 task brief — Evaluator + Trial/CampaignResult runner
+
+Following Phase 1 (merged) and Phase 2 (PR #2, verified). Turns "attack
+visibly changes control output" into formal metrics, and wraps everything
+into the `Trial`/`CampaignResult` interface Phase 4's search methods
+(random search, Bayesian opt, LLM agent) will all share.
+
+## What was built (see `docs/evaluator.md` for the full writeup)
+
+1. `docs/evaluator.md` — formal metric definitions (chattering rate,
+   steering jerk, route/lane deviation, time-to-collision-or-completion,
+   braking severity, composite `severity_score`), each with exact formula,
+   units, and an explicit Nyquist/aliasing argument for the rate-based
+   metrics (the Phase 2 aliasing bug's lesson, applied here).
+2. A real "stop and ask" resolved: `carla_gym`'s ground-truth lateral-
+   distance signal (`ValeoNoDetPx`'s own `lat_dist`) exists but only ever
+   gets baked into a debug string, never a clean field. Confirmed with the
+   project owner to replicate the same formula from the same ground-truth
+   inputs as a new logged field (`lateral_offset_m`), rather than parsing
+   debug text or deriving from the attacked BEV raster.
+3. `avredteam_carla/evaluator.py` — `EpisodeMetrics` + `evaluate(log)`,
+   pure Python, 15 unit tests against synthetic logs.
+4. `avredteam_carla/agents/campaign.py` — `Trial`/`CampaignResult` +
+   `sorted_by_severity()`, exactly the shape specified, 6 unit tests.
+5. `avredteam_carla/ground_truth.py` — real-CARLA-state computations for
+   route deviation and obstacle clearance, neither read from any existing
+   `info_dict` field.
+6. `run_clean_episode.py` refactored: `run_episode()` is now importable
+   (the CLI's `main()` is a thin wrapper around it), used by
+   `avredteam_carla/runner.py`'s `run_trial()`/`run_baseline()`.
+7. `avredteam_carla/verify_phase3.py` — runs baseline + all three Phase 2
+   attacks + a repeated-`run_trial`-call stability check, prints the
+   acceptance table.
+
+## Explicitly out of scope for this phase
+
+No search/optimization methods (random search, Bayesian opt, LLM agent) —
+Phase 4. No scenario suite beyond the single Town01 route — Phase 5.
+
+## Git workflow
+
+- Branch: `phase-3-evaluator-campaign-runner`
+- PR titled "Phase 3: Evaluator + campaign runner", acceptance table filled
+  in with real Maui results, stability-check and aliasing-check results
+  explicitly called out. Do not merge without review.

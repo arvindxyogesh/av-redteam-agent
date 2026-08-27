@@ -229,3 +229,67 @@ list, but needed to justify/cross-check `severity_score` and populate the
 acceptance table's "Time-to-collision" and "Max brake" columns — dropping
 them would mean the acceptance table couldn't actually be filled in from
 `EpisodeMetrics` alone).
+
+## 8. Running Phase 3 on Maui
+
+`avredteam_carla/evaluator.py`, `avredteam_carla/agents/campaign.py`, and
+the plumbing in `avredteam_carla/runner.py`/`run_clean_episode.py` are all
+either pure Python (evaluator, campaign) or already exercised by Phase 1/2's
+verified CLI path (the refactored `run_episode()`) — 61 unit tests pass in
+the dev sandbox that wrote this PR, no CARLA needed. What actually needs a
+real run is: the three new ground-truth fields
+(`lateral_offset_m`/`lane_half_width_m`/`nearest_actor_distance_m`, only
+exercisable against a live CARLA world), whether the resulting metrics
+numerically match Phase 2's qualitative findings, and the repeated-call
+stability check.
+
+```bash
+source /data/savyo/carla-redteam/env.sh   # same env as Phase 1/2
+cd ~/av-redteam-agent && git checkout phase-3-evaluator-campaign-runner
+
+pip install pytest   # if not already in the carla-redteam env
+python -m pytest tests/ -q   # should be 61 passed, same as the dev sandbox
+
+# CARLA server already running per docs/setup.md (launch_carla.sh)
+
+python -m avredteam_carla.verify_phase3 \
+  --roach-root "$PROJECT_DATA_DIR/roach" --host localhost --port 2100 \
+  --carla-map Town01 --weather-group simple --route-id 0 \
+  --stability-calls 6 \
+  --out logs/phase3_verification.json
+```
+
+This single script runs the baseline, all three attacks (with the exact
+params Phase 2 already verified — `docs/attacks.md` §6), the repeated-call
+stability check, and prints the acceptance table directly to stdout (also
+written to `logs/phase3_verification.json` in full).
+
+**TODO (fill in after running on Maui):**
+- Paste the printed acceptance table below, with real numbers.
+- Confirm the numeric pattern matches Phase 2's qualitative findings:
+  `geometry_spoof` should show an earlier `time_to_collision_s` and higher
+  `mean_brake` than `channel_noise`; `phantom_actor` should show a sharp
+  `max_brake_rate` spike concentrated near its trigger tick rather than a
+  high `mean_brake` overall; `channel_noise` should show a higher
+  `chattering_rate`/`max_steering_jerk` than the other two, consistent with
+  it being the oscillation/noise attack.
+- Report the stability-check numbers explicitly:
+  `actor_count_range`/`actor_count_stable` and `elapsed_s_range`/
+  `timing_stable` from the script's output — a real pass/fail on "no actor
+  leak or degradation across repeated run_trial calls", not just "it ran."
+- Confirm §1's aliasing argument against the real `channel_noise` run's
+  actual `chattering_rate` number — does it land in the expected ballpark
+  for a `frequency_hz=2.0` oscillation sampled at 10Hz (see the note in §1
+  about a clean sinusoid giving ≈0.4, not ≈1.0), or does the real (noisier,
+  policy-filtered) signal look different enough to be worth another look?
+
+### Acceptance table — real results from this node
+
+*(fill in from `verify_phase3.py`'s printed output)*
+
+| Condition | Severity | Chattering rate | Max jerk | Time-to-collision (or "completed") | Max brake |
+|---|---|---|---|---|---|
+| Baseline (clean) | | | | | |
+| channel_noise | | | | | |
+| geometry_spoof | | | | | |
+| phantom_actor | | | | | |
