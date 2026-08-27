@@ -45,11 +45,15 @@ def _import_wrapper_class(roach_root: str):
 class HookHandle:
     """Yielded by install_attack(); lets the caller confirm the patch
     actually fired (the smoke test docs/attacks.md #5 calls for) before
-    trusting any attack's results."""
+    trusting any attack's results, and grab the most recent clean/attacked
+    BEV pair for visual sanity-check PNGs (see visualize.py) without the
+    caller needing its own copy of the pre-attack observation."""
 
     def __init__(self, attack: Attack):
         self.attack = attack
         self.ticks_patched = 0
+        self.last_clean_birdview = None
+        self.last_attacked_birdview = None
 
 
 @contextlib.contextmanager
@@ -74,9 +78,13 @@ def install_attack(attack: Attack, roach_root: str):
         result = original_process_obs(obs, input_states, train=train)
         if not train:
             tick = handle.ticks_patched
-            result["birdview"], result["state"] = attack.apply(
-                result["birdview"], result["state"], tick
+            clean_birdview = result["birdview"]
+            attacked_birdview, attacked_state = attack.apply(
+                clean_birdview, result["state"], tick
             )
+            handle.last_clean_birdview = clean_birdview[0].copy()  # drop batch dim
+            handle.last_attacked_birdview = attacked_birdview[0].copy()
+            result["birdview"], result["state"] = attacked_birdview, attacked_state
             handle.ticks_patched = tick + 1
         return result
 
