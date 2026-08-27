@@ -21,12 +21,18 @@ repo (https://github.com/zhejz/carla-roach):
 What's new here: the tick loop, a hard guarantee that `control` is applied
 unmodified (zero perturbation), CSV/JSON logging, and actor/world cleanup.
 
-IMPORTANT: this script has not been executed on real hardware yet (this
-project's assistant sandbox has no GPU/Vulkan). Every field name pulled from
-`info_dict[actor_id]['episode_event']` below was read from Roach's source,
-not observed at runtime. Run with --debug-dump-info on the first real
-execution to print the raw info dict and confirm/adjust the extraction in
-`_extract_events()` before trusting the log output.
+Event/termination-reason extraction was verified against a real run on Maui
+(see docs/setup.md Sec 8) and against carla_gym source
+(`ego_vehicle_handler.py:tick`, `criteria/collision.py`,
+`criteria/outside_route_lane.py`, `terminal/valeo_no_det_px.py`):
+`info_dict[actor_id]['collision']` / `['outside_route_lane']` are per-tick
+top-level fields (falsy most ticks, a dict on the tick an event fires) -- NOT
+nested under `'episode_event'` as originally guessed pre-hardware; that key
+only appears on the final (done=True) tick and holds the whole episode's
+accumulated event buffers. ValeoNoDetPx's own `terminal_debug` carries no
+`'reason'` field at all (it's built for RL training debug text), so
+`_termination_reason()` reconstructs the reason from those same buffers
+instead of trusting a field that was never there.
 
 See docs/setup.md for full installation + the reasoning behind the CARLA
 0.9.11 (not 0.9.15) and birdview-not-camera decisions this script assumes.
@@ -110,18 +116,47 @@ def _write_seed_agent_config(path: Path, wb_run_path: str, wb_ckpt_step) -> None
 
 
 def _extract_events(info_for_actor: dict) -> dict:
-    """Pull collision / lane-invasion events out of Roach's per-tick info
-    dict. UNVERIFIED AT RUNTIME (see module docstring) - if keys differ,
-    fix here after inspecting --debug-dump-info output.
+    """Pull this tick's collision / lane-invasion events out of Roach's info
+    dict. 'collision' and 'outside_route_lane' are top-level per-tick keys
+    (see module docstring) - falsy on ticks with no event, a dict on the
+    tick one actually fires.
     """
-    episode_event = info_for_actor.get("episode_event", {})
-    terminal_debug = info_for_actor.get("terminal_debug", {})
+    collision = info_for_actor.get("collision")
+    outside_route_lane = info_for_actor.get("outside_route_lane")
     return {
-        "collision": episode_event.get("collision", []),
-        "outside_route_lane": episode_event.get("outside_route_lane", []),
-        "raw_episode_event_keys": list(episode_event.keys()),
-        "terminal_debug": terminal_debug,
+        "collision": [collision] if collision else [],
+        "outside_route_lane": [outside_route_lane] if outside_route_lane else [],
     }
+
+
+def _termination_reason(episode_event: dict) -> str:
+    """Classify why an episode ended from Roach's accumulated per-episode
+    event buffers (`info_dict[actor_id]['episode_event']`, only present on
+    the final tick - see ego_vehicle_handler.py). Checked in roughly the
+    same precedence ValeoNoDetPx.get() itself uses: blocked, red light,
+    collision, stop sign, timeout, route completed. One of ValeoNoDetPx's
+    own done conditions (lateral distance from the route too large) is
+    computed inline in that class and never surfaces in any criterion
+    buffer, so it can't be distinguished here - it falls through to
+    'unknown' like any other unclassified case.
+    """
+    if episode_event.get("vehicle_blocked"):
+        return "vehicle_blocked"
+    if episode_event.get("red_light"):
+        return "run_red_light"
+    n_collisions = sum(
+        len(episode_event.get(k, []))
+        for k in ("collisions_layout", "collisions_vehicle", "collisions_pedestrian", "collisions_others")
+    )
+    if n_collisions:
+        return "collision"
+    if episode_event.get("stop_infraction"):
+        return "run_stop_sign"
+    if episode_event.get("timeout"):
+        return "timeout"
+    if episode_event.get("route_completion", {}).get("is_route_completed"):
+        return "route_completed"
+    return "unknown (see 'episode_event' in the output file for the raw buffers)"
 
 
 def _check_control_sane(tick: int, control) -> list[str]:
@@ -198,6 +233,7 @@ def main() -> int:
         timestamp = env.timestamp
         done_dict = {"__all__": False}
         tick_idx = 0
+        final_episode_event = None
 
         while not done_dict["__all__"] and tick_idx < args.max_steps:
             control = agent.run_step(obs_dict[ACTOR_ID], timestamp)
@@ -228,7 +264,8 @@ def main() -> int:
             )
 
             if done_dict.get(ACTOR_ID):
-                termination_reason = info_dict[ACTOR_ID].get("terminal_debug", {}).get("reason", "done_flag_set")
+                final_episode_event = info_dict[ACTOR_ID].get("episode_event", {})
+                termination_reason = _termination_reason(final_episode_event)
 
             tick_idx += 1
 
@@ -254,6 +291,7 @@ def main() -> int:
             "termination_reason": termination_reason,
             "sanity_warnings": warnings,
             "final_episode_stat": final_stat,
+            "final_episode_event": final_episode_event,
             "run_timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
         },
         "ticks": ticks,
