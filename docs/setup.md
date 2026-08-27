@@ -44,6 +44,40 @@ If inference looks wrong or crashes in a way that traces back to any of these
 choices, stop and re-open the discussion rather than silently patching around
 it — these were explicit trade-offs, not guesses.
 
+- **CARLA server delivery: official Docker image, not the S3 tarball.**
+  `https://carla-releases.s3.eu-west-3.amazonaws.com/Linux/CARLA_0.9.11.tar.gz`
+  (the URL this doc and Roach's own `doc/INSTALL.md` both specify) is dead —
+  the eu-west-3 bucket 301-redirects with no `Location` header (S3's way of
+  saying "wrong region, retry"), and every region-corrected variant we tried
+  (`s3.us-west-2`, `s3-us-west-2` dash form, generic `s3.amazonaws.com`) 403s.
+  CARLA appears to have pruned pre-0.9.12 raw tarballs from that bucket. The
+  official `carlasim/carla:0.9.11` Docker Hub image (pushed 2020-12-23, still
+  active, ~4.6GB) is the working substitute — same server binary, and it
+  still contains a full `PythonAPI/` tree we extract the client wheel from.
+  This machine already had the nvidia container runtime and CDI GPU devices
+  configured, so `docker run --gpus device=N ...` was a straightforward swap
+  for the bare `CarlaUE4.sh` invocation. See §4/§5 below.
+- **PyTorch: no CUDA build supports the H200 in a Python-3.7 env — fell back
+  to CPU inference for Roach's policy net.** Roach's checkpoint loading and
+  the CARLA 0.9.11 Python client are both effectively pinned to Python 3.7
+  (no `carla` wheel for 0.9.11 exists for any newer CPython on PyPI, and
+  builds are ABI-specific). PyPI's newest `cp37` PyTorch wheel is `1.13.1`
+  (`+cu117`); `pytorch.org`'s cu118/cu121 indices only ship `cp37` wheels for
+  `manylinux2014_aarch64`, not x86_64. Loading `torch==1.13.1+cu117` on this
+  node's H200 (compute capability sm_90) prints PyTorch's own
+  `"NVIDIA H200 ... is not compatible with the current PyTorch installation"`
+  warning (supported archs top out at sm_86 — Ampere) and a real op on a CUDA
+  tensor hangs/never returns. CUDA 11.8 was the first toolkit release with
+  official Hopper (sm_90a) support, and no post-CUDA-11.8 PyTorch wheel was
+  ever built for Python 3.7. Net effect: within a Python-3.7 env there is no
+  "newer CUDA-compatible wheel" that actually runs on this GPU — the fix the
+  task brief anticipated tops out at torch 1.13.1, which still doesn't work
+  here. We run Roach's PPO policy net on CPU (`device="cpu"`, small
+  birdview-CNN + MLP, negligible latency at 10Hz) while the CARLA server
+  itself still renders on the pinned GPU via `-RenderOffScreen`/Vulkan — the
+  server process is what "GPU actually used" in the acceptance table below
+  refers to, since that's the only heavy GPU consumer in this pipeline.
+
 ## 1. Directory layout — everything under `/data/$USER`
 
 `/home` on Maui is small/quota-limited; all project code, conda envs, package
@@ -97,8 +131,13 @@ GPU — prefer one that's idle. GPU selection is passed explicitly to every
 script below via `CUDA_VISIBLE_DEVICES` / a `--gpu` flag; nothing is
 hardcoded to GPU 0.
 
-**TODO (fill in after running on Maui):** exact GPU model(s), driver version,
-and which GPU id was idle/selected.
+**Observed on this node:** 8x NVIDIA H200 (143.8GB each), driver 595.58.03,
+`nvidia-smi`-reported CUDA 13.2 (Vulkan-capable — H200/Hopper is far newer
+than the Turing baseline CARLA 0.9.11's UE4 renderer needs). GPUs 0, 1, 2, 5
+were running other users' jobs (VLLM engine cores) at the time of this run;
+GPUs 3, 4, 6, 7 were idle (0MiB used, 0% util). **GPU 3 selected** — passed
+explicitly via `CUDA_VISIBLE_DEVICES=3` (bare-binary path) or
+`--gpus device=3` (Docker path, see §4), never hardcoded in any script.
 
 ## 3. Create the conda/micromamba environment
 
@@ -130,40 +169,121 @@ unpinned subset actually needed (`torch`, `gym==0.21.*`, `hydra-core`,
 `omegaconf`, `wandb`, `stable-baselines3`, `carla` client wheel) — but try the
 pinned file first since Roach's checkpoint loading is version-sensitive.
 
+**What actually happened on this node:** skipped straight to the relaxed
+`python=3.7` + unpinned-subset path rather than attempting the full
+`environment.yml` solve. Two reasons: (1) `cudatoolkit=10.1`/`pytorch=1.4.0`
+in that file cannot run on this node's H200 regardless (see §0), so solving
+it would burn time on a ~200-package, TensorFlow-inclusive 2020 conda-forge
+environment (TF isn't even used by the birdview RL agent — it's a leftover
+from a CILRS/training path this phase doesn't touch) for no payoff; (2) it
+would need to re-solve/re-download several GB of packages this phase doesn't
+exercise. Used the pre-existing micromamba binary at
+`/home/savyo/micromamba/bin/micromamba` (v2.8.1) rather than re-downloading
+one, with `MAMBA_ROOT_PREFIX=$PROJECT_DATA_DIR/envs` so the env itself still
+lands under `/data/$USER` per §1:
+
+```bash
+/home/savyo/micromamba/bin/micromamba create -y -n carla-redteam -c conda-forge python=3.7
+```
+
+This produced Python 3.7.12. Then, into that env's `bin/python -m pip`:
+`torch==1.13.1` (newest `cp37` wheel on PyPI; see §0 for why this still ends
+up CPU-only on this GPU), `gym==0.21.0`, `hydra-core==1.0.3`,
+`omegaconf==2.0.2`, `wandb==0.15.12`, `stable-baselines3==0.8.0`,
+`opencv-python==4.5.1.48`, `imgaug==0.4.0`, `pygame`, `dictor`, `networkx`,
+`shapely`, `tabulate`, `pillow`, and (pinned, see below) `py-trees==0.8.3`.
+
+Two real install/runtime snags hit and fixed along the way, both from
+installing 2020-era packages against a current pip/Python-ecosystem:
+
+- `gym==0.21.0` failed `setup.py egg_info` under current `setuptools` with
+  `error in gym setup command: 'extras_require' must be a dictionary whose
+  values are strings or lists of strings...` — fixed by installing
+  `setuptools==65.5.0 wheel==0.38.4` into the env *before* installing gym
+  (well-known gym-0.21 / modern-setuptools incompatibility).
+- `gym==0.21.0` then installed but failed on `import gym` with
+  `AttributeError: 'EntryPoints' object has no attribute 'get'` — a
+  breaking API change in newer `importlib_metadata`. Fixed by pinning
+  `importlib-metadata==4.13.0`.
+- Installing bare `py-trees` (unpinned) pulled a modern (2.x) release that
+  fails to import under Python 3.7 (`TypeError: 'type' object is not
+  subscriptable`, from `list[...]`-style builtin generics in its source,
+  which need Python 3.9+). Fixed by pinning `py-trees==0.8.3`, the exact
+  version Roach's `environment.yml` specifies.
+
 ## 4. Install CARLA 0.9.11 (server + Python API)
 
-Project-local, under `$PROJECT_DATA_DIR` (not system-wide):
+**What actually worked on this node: the official Docker image, not the S3
+tarball.** Both S3 URLs in the block below are dead (see §0 for exactly what
+was tried and how it failed — 301-with-no-Location, then 403 on every
+region-corrected endpoint). Keeping the original recipe here for reference /
+in case the bucket comes back, but do not expect it to work:
 
 ```bash
 mkdir -p "$PROJECT_DATA_DIR/CARLA_0.9.11" && cd "$PROJECT_DATA_DIR/CARLA_0.9.11"
-wget https://carla-releases.s3.eu-west-3.amazonaws.com/Linux/CARLA_0.9.11.tar.gz
+wget https://carla-releases.s3.eu-west-3.amazonaws.com/Linux/CARLA_0.9.11.tar.gz   # DEAD, see §0
 tar -xvzf CARLA_0.9.11.tar.gz
 mkdir -p Import
-wget -P Import https://carla-releases.s3.eu-west-3.amazonaws.com/Linux/AdditionalMaps_0.9.11.tar.gz
+wget -P Import https://carla-releases.s3.eu-west-3.amazonaws.com/Linux/AdditionalMaps_0.9.11.tar.gz  # DEAD, see §0
 bash ImportAssets.sh
 rm CARLA_0.9.11.tar.gz Import/AdditionalMaps_0.9.11.tar.gz
-
-export CARLA_ROOT="$PROJECT_DATA_DIR/CARLA_0.9.11"
 ```
 
-Verify the S3 URLs are still live before relying on them — CARLA has moved
-release hosting before. If `carla-releases.s3.eu-west-3.amazonaws.com` 404s,
-check https://github.com/carla-simulator/carla/releases/tag/0.9.11 for the
-current asset links.
-
-Install the Python client API into the `carla-redteam` env (egg filename must
-match the Python version the env actually has — 3.7 per Roach's pinned env):
+**Actual recipe used:** pull the official `carlasim/carla:0.9.11` Docker Hub
+image (this is also literally how CARLA's own docs recommend running it
+headless on Linux, tarball or not), then copy the two things we need — the
+`PythonAPI/` tree and `CarlaUE4.sh` — out to `$PROJECT_DATA_DIR/CARLA_0.9.11`
+so the rest of this doc's paths (`$CARLA_ROOT`, `launch_carla.sh`) still work
+unchanged; the server itself still runs *inside* the container (see §5 for
+`launch_carla.sh`'s Docker mode), this is only to get local access to the
+Python API without a second full checkout:
 
 ```bash
-micromamba activate carla-redteam
-easy_install "$CARLA_ROOT/PythonAPI/carla/dist/carla-0.9.11-py3.7-linux-x86_64.egg"
-# or, if that env ships pip-friendly wheels instead:
-pip install "$CARLA_ROOT/PythonAPI/carla/dist/carla-0.9.11-cp37-cp37m-linux_x86_64.whl"
+export CARLA_ROOT="$PROJECT_DATA_DIR/CARLA_0.9.11"
+docker pull carlasim/carla:0.9.11
+docker create --name carla_extract_0911 carlasim/carla:0.9.11
+mkdir -p "$CARLA_ROOT"
+docker cp carla_extract_0911:/home/carla/PythonAPI "$CARLA_ROOT/PythonAPI"
+docker cp carla_extract_0911:/home/carla/CarlaUE4.sh "$CARLA_ROOT/CarlaUE4.sh"
+docker rm carla_extract_0911
 ```
 
-**TODO (fill in after running on Maui):** which of the two installs above
-actually worked (`easy_install` vs `pip install` — depends on what CARLA
-0.9.11 ships in `PythonAPI/carla/dist/`).
+This produced `$CARLA_ROOT/PythonAPI/carla/dist/carla-0.9.11-py3.7-linux-x86_64.egg`
+(and a `py2.7` one we don't need) — an **egg**, not a wheel, matching the
+Python 3.7 env from §3.
+
+Install the Python client API into the `carla-redteam` env. Modern
+`setuptools` (65.5.0, what we're on after the §3 gym fix) dropped the
+`easy_install` console script entirely, so the documented `easy_install
+path/to.egg` command from Roach's own install doc no longer works out of the
+box. The CARLA 0.9.11 egg is just a zip of a pure-Python `carla/` package
+plus one compiled `.so` (`libcarla.cpython-37m-x86_64-linux-gnu.so`) — no
+build step, no `EGG-INFO` machinery actually needed at runtime — so we
+extracted it directly into `site-packages` instead:
+
+```bash
+ENVDIR="$MAMBA_ROOT_PREFIX/envs/carla-redteam"
+python3 -c "
+import zipfile
+z = zipfile.ZipFile('$CARLA_ROOT/PythonAPI/carla/dist/carla-0.9.11-py3.7-linux-x86_64.egg')
+for n in z.namelist():
+    if n.startswith('carla/'):
+        z.extract(n, '$ENVDIR/lib/python3.7/site-packages')
+"
+```
+
+This first failed with `ImportError: libtiff.so.5: cannot open shared object
+file` — the compiled `libcarla.so` was built against the same 2020-era
+`libtiff=4.1.0` pinned in Roach's `environment.yml`, and no `libtiff.so.5`
+exists on this host or in the fresh Python-3.7 env. Fixed by installing that
+exact conda-forge package (a native-lib install, unrelated to the Python
+version) into the env:
+
+```bash
+micromamba install -y -p "$ENVDIR" -c conda-forge "libtiff=4.1.0"
+```
+
+After that, `python -c "import carla; carla.Client"` succeeds cleanly.
 
 ## 5. Launch CARLA headless
 
@@ -178,8 +298,51 @@ CARLA_ROOT="$PROJECT_DATA_DIR/CARLA_0.9.11" ./scripts/launch_carla.sh 1 2000
 This pins the server to GPU 1 via `CUDA_VISIBLE_DEVICES`, runs
 `-RenderOffScreen` (headless), and listens for RPC on port 2000.
 
-**TODO (fill in after running on Maui):** confirm the server actually starts
-and stays up (check the log file the script writes) before moving on.
+**What actually happened on this node — a real, silent crash and its fix.**
+`./scripts/launch_carla.sh 3 2000` (Docker mode, the default per §4) at first
+had the container exit immediately every time, with **zero diagnostic
+output** other than a harmless `sh: 1: xdg-user-dir: not found` line. This
+took real debugging to root-cause since nothing about it looked like a
+graphics/driver problem at first glance:
+
+1. Confirmed it wasn't a missing-GPU/Vulkan-driver problem: installed
+   `vulkan-utils` inside the container and ran `vulkaninfo --summary` — it
+   correctly enumerated the pinned GPU (`deviceName = NVIDIA H200`,
+   `DISCRETE_GPU`, Vulkan 1.4). So the GPU passthrough, ICD, and driver libs
+   (all supplied automatically by this host's `nvidia-container-toolkit` CDI
+   integration via `--gpus device=N` — no extra mounts needed) were all fine.
+2. Confirmed it wasn't a signal crash (segfault/abort): ran the binary
+   directly under `gdb -batch -ex run -ex bt`. gdb reported a clean
+   `exited with code 01` — no signal caught, meaning the engine itself
+   deliberately called `exit(1)` somewhere, not a fault.
+3. Set a breakpoint on `exit`/`_exit` instead (`gdb -ex "break exit" -ex
+   run -ex bt`) to catch it in the act. The backtrace pinned it exactly:
+   ```
+   #0 __GI__exit
+   #1 FUnixPlatformMisc::RequestExit
+   #2 FUnixPlatformMisc::RequestExitWithStatus
+   #3 FLinuxApplication::CreateLinuxApplication (LinuxApplication.cpp:46)
+   #4 FSlateApplication::Create
+   #5 FEngineLoop::PreInitPreStartupScreen
+   ```
+   This happens in Slate/UE4's windowing layer, *before* the Vulkan RHI is
+   ever touched — `-RenderOffScreen` only tells CARLA's renderer to draw to
+   an off-screen target, it does **not** stop the underlying SDL2 windowing
+   library from first trying to open a real display connection. With no
+   `DISPLAY` and no X server in the container, `SDL_Init(SDL_INIT_VIDEO)`
+   fails and UE4 exits(1) via exactly this path — a well-known UE4-on-Linux
+   headless gotcha, just an unusually silent one in a Shipping build (no log
+   file is opened yet at this point in startup, so nothing is written
+   anywhere for a normal user to find).
+4. Fix: set `SDL_VIDEODRIVER=offscreen` in the container's environment so
+   SDL never tries to reach a real display. `launch_carla.sh`'s Docker mode
+   now passes `-e SDL_VIDEODRIVER=offscreen`, plus `--shm-size=2g` (UE4's
+   shared-memory needs under the small Docker default) and `-nocrashreports`
+   (skip spawning the interactive CrashReportClient, irrelevant headless).
+
+After this fix, `./scripts/launch_carla.sh 3 2000` starts and **stays up**
+(verified via `docker ps` + `nvidia-smi` showing GPU 3 climb from 0MiB to
+~1GB used while the container runs) — confirmed working end-to-end in §6.
 
 ## 6. Verify client connection
 
@@ -188,7 +351,39 @@ python scripts/check_client_connection.py --host localhost --port 2000
 ```
 
 This connects via `carla.Client`, calls `get_world()`, and lists available
-maps and blueprints. **TODO:** paste the actual output here once run.
+maps and blueprints. **Actual output from this node** (GPU 3, server from §5):
+
+```
+Connecting to CARLA at localhost:2000 ...
+Connected. Client version: 0.9.11
+Server version: 0.9.11
+
+Available maps:
+  /Game/Carla/Maps/Town01
+  /Game/Carla/Maps/Town01_Opt
+  /Game/Carla/Maps/Town02
+  /Game/Carla/Maps/Town02_Opt
+  /Game/Carla/Maps/Town03
+  /Game/Carla/Maps/Town03_Opt
+  /Game/Carla/Maps/Town04
+  /Game/Carla/Maps/Town04_Opt
+  /Game/Carla/Maps/Town05
+  /Game/Carla/Maps/Town05_Opt
+
+Currently loaded map: Town03
+
+Blueprint library: 162 blueprints
+  vehicle.* blueprints: 31
+  sensor.* blueprints: 13
+
+OK: client connection verified.
+```
+
+Client and server versions match (0.9.11/0.9.11) confirming the egg
+extracted in §4 is the right build for this server. The server's default
+boot map is Town03, not Town01 — irrelevant here since `run_clean_episode.py`
+(§8) explicitly requests Town01 via `carla_map=` when it creates the
+`LeaderBoard-v0` env, which loads/switches maps itself.
 
 ## 7. Run Roach's own eval tooling standalone (no custom code)
 
