@@ -46,6 +46,16 @@ echo "Log: ${LOG_FILE}"
 
 if [[ "$LAUNCH_MODE" == "docker" ]]; then
   CONTAINER_NAME="carla_gpu${GPU_ID}_port${PORT}"
+  # Persistent shader-cache volume (survives container recreation, e.g. a
+  # relaunch after a crash) - UE4/the NVIDIA driver both cache compiled
+  # Vulkan shaders under $HOME=/home/carla in the image; without this every
+  # fresh container recompiles from scratch, which can be slow enough on
+  # first load of a new map to trip client-side RPC timeouts. The "carla"
+  # user in the image is uid 1000, unlikely to match the host account
+  # running this script, hence the chmod.
+  CACHE_DIR="${CARLA_LOG_DIR:-${CARLA_ROOT:-.}/../logs}/../cache/carla_home_gpu${GPU_ID}"
+  mkdir -p "$CACHE_DIR"
+  chmod 777 "$CACHE_DIR"
   docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   docker run -d \
     --name "$CONTAINER_NAME" \
@@ -53,6 +63,7 @@ if [[ "$LAUNCH_MODE" == "docker" ]]; then
     --net=host \
     --shm-size=2g \
     -e SDL_VIDEODRIVER=offscreen \
+    -v "$(cd "$CACHE_DIR" && pwd)":/home/carla/.config \
     "$DOCKER_IMAGE" \
     ./CarlaUE4.sh \
       -RenderOffScreen \

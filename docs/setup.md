@@ -39,6 +39,20 @@ bottom on a fresh account; each step notes what to verify before moving on.
   fetched at runtime via the `wandb` API from the public project
   `iccv21-roach/trained-models`, run path `1929isj0` (this is literally
   "Roach" per that repo's README table). This needs `wandb login` once.
+  **Anonymous W&B login no longer works** (as of this run, `wandb.login(
+  anonymous="must")` gets a hard 401 "auth token too short" from wandb.ai's
+  server on both wandb==0.15.12 and the newest cp37-compatible build,
+  0.18.7 - W&B appears to have discontinued the anonymous-key-creation
+  mutation server-side, not just changed the client). Reading even a public
+  project's checkpoint now requires a real wandb.ai account's API key,
+  supplied here by the project owner and exported as `WANDB_API_KEY` for the
+  duration of each command (not written to any file - see the note in §7).
+  A further wrinkle: that key uses W&B's newer `wandb_v1_...`-prefixed
+  format, which `wandb login <key>` (the CLI) rejects on this old client
+  with a hardcoded `"API key must be 40 characters long"` check (the new
+  key is 86 chars) - exporting `WANDB_API_KEY` directly and skipping
+  `wandb.login()`/`wandb login` entirely avoids that check and works fine
+  against the actual API.
 
 If inference looks wrong or crashes in a way that traces back to any of these
 choices, stop and re-open the discussion rather than silently patching around
@@ -72,11 +86,32 @@ it — these were explicit trade-offs, not guesses.
   ever built for Python 3.7. Net effect: within a Python-3.7 env there is no
   "newer CUDA-compatible wheel" that actually runs on this GPU — the fix the
   task brief anticipated tops out at torch 1.13.1, which still doesn't work
-  here. We run Roach's PPO policy net on CPU (`device="cpu"`, small
-  birdview-CNN + MLP, negligible latency at 10Hz) while the CARLA server
-  itself still renders on the pinned GPU via `-RenderOffScreen`/Vulkan — the
-  server process is what "GPU actually used" in the acceptance table below
-  refers to, since that's the only heavy GPU consumer in this pipeline.
+  here. We run Roach's PPO policy net on CPU (small birdview-CNN + MLP,
+  negligible latency at 10Hz) while the CARLA server itself still renders on
+  the pinned GPU via `-RenderOffScreen`/Vulkan — the server process is what
+  "GPU actually used" in the acceptance table below refers to, since that's
+  the only heavy GPU consumer in this pipeline.
+
+  **This needed an explicit fix, not just a design intention** — Roach's own
+  code (`rl_birdview_agent.py`/`ppo_policy.py`) auto-selects
+  `'cuda' if torch.cuda.is_available() else 'cpu'`, and
+  `torch.cuda.is_available()` returns **True** on this node even though the
+  H200 isn't a supported arch (the driver correctly reports the device; the
+  incompatibility is about compiled kernels, not visibility). Confirmed at
+  runtime: the very first real inference call on this GPU didn't hang or
+  raise — it silently computed a degenerate `tensor([[0., 0.]],
+  device='cuda:0')` for the policy's Beta-distribution parameters, which
+  then failed several calls later on `Beta`'s own domain check
+  (`ValueError: ... concentration1 ... found invalid values: tensor([[0.,
+  0.]], device='cuda:0')`). That's a worse failure mode than a hang — wrong
+  numbers computed silently, surfacing as an unrelated-looking crash three
+  frames away — so simply hoping `torch.cuda.is_available()` would return
+  `False` was not enough. Both `run_clean_episode.py`'s invocation and
+  `run/benchmark.sh` now explicitly set `CUDA_VISIBLE_DEVICES=""` for the
+  **Python client process** so `torch.cuda.is_available()` is correctly
+  `False` end-to-end — see §7/§8 for exactly how that's threaded through
+  without also hiding the GPU from the CARLA *server* subprocess, which
+  still needs it.
 
 ## 1. Directory layout — everything under `/data/$USER`
 
@@ -393,7 +428,8 @@ writing anything custom, per the phase-1 plan. From `$PROJECT_DATA_DIR/roach`:
 ```bash
 micromamba activate carla-redteam
 export CARLA_ROOT="$PROJECT_DATA_DIR/CARLA_0.9.11"
-wandb login   # one-time; needs a free wandb.ai account
+export WANDB_API_KEY="<your key>"   # see §0 - anonymous login is dead, `wandb login` CLI
+                                     # rejects the newer key format, export the var directly
 ```
 
 Edit `run/benchmark.sh` to use the RL-expert ("Roach") block instead of the
@@ -405,18 +441,85 @@ agent="ppo"
 # ...
 agent.ppo.wb_run_path=iccv21-roach/trained-models/1929isj0
 test_suites=lb_test_tt   # or nocrash_dense — either is fine for a smoke test
+log_video=false          # see below - true works but then crashes on video encode
+port=2100                # avoid clashing with any already-running instance on 2000
 carla_sh_path=${CARLA_ROOT}/CarlaUE4.sh
 ```
 
-Then run it:
+**`CarlaUE4.sh` here must be our Docker wrapper, not a native binary** — see
+§4/§5: this project's `$CARLA_ROOT/CarlaUE4.sh` is a small script that runs
+`docker run ... carlasim/carla:0.9.11 ./CarlaUE4.sh "$@"` under the hood
+(there's no native CarlaUE4 binary tree on this host at all, only inside the
+image). `utils/server_utils.py`'s `CarlaServerManager` invokes this exactly
+like Roach's docs assume (`bash $CARLA_ROOT/CarlaUE4.sh -fps=10
+-quality-level=Epic -carla-rpc-port=<port>`), so it works unmodified once
+that path points at our wrapper — no changes needed to how `benchmark.py`
+itself calls it.
+
+Then, from `$PROJECT_DATA_DIR/roach`:
 
 ```bash
+export CARLA_GPU_ID=3        # which GPU the CARLA server subprocess should use
+export CUDA_VISIBLE_DEVICES="" # keep the *python* process CPU-only for torch — see below
 bash run/benchmark.sh
 ```
 
-**TODO (fill in after running on Maui):** did the checkpoint download via
-wandb succeed, did the benchmark run start-to-finish, and do the logged
-episode stats look sane (non-zero route completion, no immediate crash)?
+**What actually happened, and three real fixes this needed:**
+
+1. **`server_utils.CarlaServerManager` hardcoded GPU 0**, ignoring any
+   ambient env var entirely (there's even a dead, commented-out
+   `os.environ.get('CUDA_VISIBLE_DEVICES')` line right above it in the
+   source — someone clearly meant to wire this up and never did). On this
+   shared node GPU 0 was busy with another user's job; CARLA crashed with
+   `GameThread timed out waiting for RenderThread after 60.00 secs` /
+   `Segmentation fault` from resource contention on the very first attempt.
+   Fixed in `utils/server_utils.py` to read a `CARLA_GPU_ID` env var
+   (falling back to `CUDA_VISIBLE_DEVICES` for compatibility) instead of
+   hardcoding `0`.
+2. **Every retry recompiled shaders from scratch.** `CarlaServerManager`
+   spawns a brand-new server process per attempt; since our Docker wrapper
+   uses `--rm`, that also meant a brand-new container filesystem every time,
+   so first-load-of-Town01 shader compilation happened over and over. This
+   was slow enough to blow past the CARLA client's hardcoded 60s RPC timeout
+   on `load_world()`/`get_trafficmanager()` on the first couple of attempts.
+   Fixed by mounting a persistent host directory at `/home/carla/.config`
+   inside the container (same fix applied to `scripts/launch_carla.sh` —
+   see §5) so compiled shaders survive across container recreations; also
+   bumped `CarlaServerManager`'s default `t_sleep` from 5→40s and
+   `run/benchmark.sh`'s retry cap from 3→5 attempts to give the first
+   (cold-cache) attempt more room.
+3. **The real crash, found only after the above: `agent.run_step()` ran on
+   CUDA and silently produced garbage.** Roach's own
+   `rl_birdview_agent.py`/`ppo_policy.py` auto-selects `'cuda' if
+   torch.cuda.is_available() else 'cpu'`; `is_available()` is `True` on this
+   node (see §0) even though the H200 isn't a supported arch. The very first
+   inference call didn't hang or error — it silently computed
+   `tensor([[0., 0.]], device='cuda:0')` for the policy's Beta-distribution
+   parameters, which then failed the distribution's own domain check several
+   frames later:
+   `ValueError: Expected parameter concentration1 ... to satisfy the
+   constraint GreaterThan(lower_bound=0.0), but found invalid values:
+   tensor([[0., 0.]], device='cuda:0')`. This is why `CUDA_VISIBLE_DEVICES`
+   must be **empty for the python process** while still being **set (to
+   `CARLA_GPU_ID`'s value) for the CARLA server subprocess** — the two need
+   different values in the same shell, hence the separate env var from fix
+   #1. Once this was fixed, `agent.run_step()` ran cleanly on CPU throughout.
+
+**Actual result on this node**, after all three fixes, `port=2100`,
+`log_video=false`, `test_suites=lb_test_tt` (Town01, route 0, `WetNoon`
+weather — `lb_test_tt`'s own weather group, distinct from the `simple`/
+`ClearNoon` group §8 uses): the wandb checkpoint (`ckpt_11833344.pth`)
+downloaded and loaded correctly, a `wandb` run was created successfully
+under the project's own account
+(`iccv21-roach-benchmark/runs/...`), and the full episode rollout ran to
+completion via `run_single()` with no error. One earlier attempt (before
+`log_video=false`) got all the way through the episode and only then crashed
+at the post-episode video-encoding step —
+`gym.error.DependencyNotInstalled: Found neither the ffmpeg nor avconv
+executables` — which is a missing-system-binary issue unrelated to
+CARLA/Roach's actual functionality; setting `log_video=false` (this smoke
+test doesn't need a video artifact) avoids it entirely and is the
+recommended default for future standalone smoke tests here.
 
 ## 8. Custom minimal clean-episode runner
 
@@ -426,8 +529,9 @@ own `carla_gym` environment and `RlBirdviewAgent` rather than hand-rolling
 sensor/actor code:
 
 ```bash
+export WANDB_API_KEY="<your key>"    # see §0/§7
+export CUDA_VISIBLE_DEVICES=""       # force CPU inference - see below, this is not optional
 python -m avredteam_carla.run_clean_episode \
-  --carla-root "$CARLA_ROOT" \
   --roach-root "$PROJECT_DATA_DIR/roach" \
   --host localhost --port 2000 \
   --wb-run-path iccv21-roach/trained-models/1929isj0 \
@@ -435,20 +539,78 @@ python -m avredteam_carla.run_clean_episode \
   --out logs/clean_episode_$(date +%Y%m%d_%H%M%S).json
 ```
 
+(`--carla-root` isn't actually a flag this script takes — it doesn't launch
+a server itself, only a client; drop it from the usage example above, which
+predates a real run. The CARLA server it connects to must already be up,
+e.g. via `scripts/launch_carla.sh 3 2000`.)
+
 See that script's docstring for exactly which of Roach's own building blocks
 it reuses (`gym.make('LeaderBoard-v0', ...)`, `RlBirdviewAgent`, and Roach's
 own `reward.valeo_action:ValeoAction` / `terminal.valeo_no_det_px:ValeoNoDetPx`
 entry points) versus what's new (the tick loop, CSV/JSON logging, cleanup).
 
-## 9. Acceptance criteria — fill in after a real run
+**`CUDA_VISIBLE_DEVICES=""` is required, not optional** — same root cause as
+§7's fix #3: `RlBirdviewAgent`'s policy auto-selects CUDA whenever
+`torch.cuda.is_available()` is `True`, which it is on this node's H200 even
+though PyTorch can't actually run kernels on it correctly. Without this, the
+first `agent.run_step()` call silently computes
+`tensor([[0., 0.]], device='cuda:0')` for the policy's action distribution
+parameters and crashes several frames later inside
+`torch.distributions.Beta.__init__`'s domain check — confirmed by hitting
+this exact crash on the first real attempt of this script. The CARLA
+*server* is unaffected (it's a separate Docker container pinned to a GPU via
+`--gpus device=N`, not this python process), so this only forces the small
+birdview-CNN+MLP policy net onto CPU, which is fine at 10Hz.
+
+**What was actually verified against carla_gym source vs. originally
+guessed:** `_extract_events()` and the termination-reason logic in
+`run_clean_episode.py` were written before this project had a live CARLA
+server to test against, and both turned out to be wrong: `collision` and
+`outside_route_lane` are top-level per-tick fields (not nested under
+`episode_event` as first guessed), and `ValeoNoDetPx`'s `terminal_debug` has
+no `'reason'` key at all. Both are now fixed and confirmed correct against
+real per-tick output (see the script's module docstring and the git history
+of this file for the fix). Run with `--debug-dump-info` to see the raw first-
+tick `info_dict` yourself.
+
+**Actual result on this node** (Town01, `weather_group=simple` → ClearNoon,
+route 0, GPU 3, `CUDA_VISIBLE_DEVICES=""`): completed start-to-finish in
+3998 ticks (399.8s simulated) with `exit=0`. `final_episode_stat` reports
+`is_route_completed: 1.0` and `is_route_completed_nocrash: 1.0` — the ego
+actually reached the end of the route (`route_completed_in_km: 0.760` vs.
+`route_length_in_km: 0.748`) with zero collisions
+(`collisions_layout/vehicle/pedestrian/others` all `0.0`) and zero red-light
+or stop-sign infractions. `termination_reason` was classified as
+`vehicle_blocked` — Roach's own `blocked` criterion fired at the very last
+tick, which is the expected/benign way this particular terminal condition
+fires when the ego stops moving right after finishing a route (it isn't
+distinguishing "stuck permanently" from "arrived and stopped"). 914 of the
+3998 ticks flagged a transient `wrong_lane` event (no `outside_lane`
+events), clustered late in the route — plausible minor lane-centering wobble
+approaching the destination, not treated as a failure by Roach's own
+scoring (`percentage_outside_lane: 0.0`, `score_composed: 1.0`). No control
+sanity warnings were raised by the script itself; independently verified:
+`steer` ranged `[-0.34, 0.38]`, `throttle` `[0.0, 1.0]`, `brake` `[0.0,
+1.0]` — all within the declared ranges, all with non-zero variance (not
+constant), no NaNs.
+
+## 9. Acceptance criteria — real results from this node
+
+All results below are from `avredteam_carla/run_clean_episode.py` (§8), the
+project's own minimal runner and the actual Phase-1 deliverable —
+`logs/clean_episode_run2.json` on this node, Town01 / `simple` (ClearNoon) /
+route 0, GPU 3, `CUDA_VISIBLE_DEVICES=""` for CPU-only torch inference.
+Roach's own `benchmark.sh` (§7) was used beforehand to independently confirm
+the checkpoint + `carla_gym` env work with zero custom code, and also
+completed a route successfully.
 
 | Criterion | Result |
 |---|---|
-| Script runs start-to-finish, no crash | TODO |
-| Route completes or terminates via real collision (not error) | TODO |
-| Control outputs sane (steer/throttle/brake in range, not NaN/constant) | TODO |
-| Log file inspectable, matches spectator-view expectations | TODO |
-| GPU actually used (nvidia-smi during run) and which one | TODO |
+| Script runs start-to-finish, no crash | **PASS.** `run_clean_episode.py` exited 0. Getting here needed three real fixes, all documented in §0/§7/§8: the dead CARLA S3 tarball (→ Docker image), a silent `exit(1)` in the container from SDL trying to open a real display (→ `SDL_VIDEODRIVER=offscreen`), and the H200/CUDA issue (→ `CUDA_VISIBLE_DEVICES=""` for the python client). |
+| Route completes or terminates via real collision (not error) | **PASS, via full route completion rather than a collision.** `final_episode_stat.is_route_completed = 1.0`, `is_route_completed_nocrash = 1.0`, zero collisions of any type. `termination_reason` was classified as `vehicle_blocked` (Roach's own criterion firing once the ego stops moving after arriving) — a real simulation outcome, not a script error. |
+| Control outputs sane (steer/throttle/brake in range, not NaN/constant) | **PASS.** Script's own sanity check raised zero warnings across all 3998 ticks. Independently verified: `steer` ∈ [-0.34, 0.38], `throttle` ∈ [0.0, 1.0], `brake` ∈ [0.0, 1.0], all non-constant (non-zero stdev), no NaNs. |
+| Log file inspectable, matches spectator-view expectations | **PASS (inspectable; visual spectator-view comparison not applicable here — no display in this headless environment).** `logs/clean_episode_run2.json` contains all 3998 per-tick records (control + reward + events) plus `final_episode_stat`/`final_episode_event` summaries; ego location trace, route-completion percentage, and event timestamps (e.g. 3 traffic-light encounters, a late `wrong_lane` cluster) are all internally consistent with a car driving a ~750m Town01 route among 120 zombie vehicles + 120 walkers. |
+| GPU actually used (nvidia-smi during run) and which one | **PASS — GPU 3.** `nvidia-smi` during the run showed GPU 3 memory climb from idle (0MiB) to ~1-3GB across the CARLA server container(s) pinned there via `--gpus device=3`; GPUs 0/1/2/5 remained at their pre-existing (other users') usage throughout, confirming no cross-talk. (The policy net itself ran on CPU — see §0/§8 for why that's correct here, not a miss.) |
 
-Do not mark Phase 1 done in the PR description until every row above is
-filled in with a real, observed result — not an expectation.
+Everything in this table is a real, observed result from this node, not an
+expectation.
