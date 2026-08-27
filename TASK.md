@@ -85,3 +85,56 @@ No attacks, no search/optimization methods, no LLM agent integration.
   the acceptance-criteria results. Do not merge without review.
 - If anything requires a design decision not covered above or in
   docs/setup.md §0, stop and ask rather than guessing.
+
+---
+
+# Phase 2 task brief — BEV-space sensor attack library
+
+Following Phase 1 (merged: CARLA 0.9.11 + Roach headless on Maui, clean
+episodes verified). Correction from Phase 1: Roach's `RlBirdviewAgent`
+consumes a rasterized birdview (BEV) image + scalar state — not camera/
+lidar. "Sensor-level attack" means perturbing that BEV raster and scalar
+state, injected between `carla_gym`'s observation manager and the policy's
+forward pass — not attacking raw CARLA actors or camera buffers.
+
+## Goal
+
+A small library of attacks on Roach's actual observation space (BEV raster
++ scalar state), each verified to measurably change Roach's control output
+vs. a clean baseline, with visual (PNG) sanity checks since the cluster run
+is headless.
+
+## What was built (see `docs/attacks.md` for the full writeup)
+
+1. `docs/attacks.md` §1-4 — the real BEV/scalar-state layout and the exact
+   interception point, read from `carla-roach` source (chauffeurnet.py,
+   rl_birdview_wrapper.py, rl_birdview_agent.py), not the paper.
+2. `avredteam_carla/attacks/base.py` — `Attack` base class +
+   `TunableParam` declarative schema (name/type/range/default), the shared
+   contract later phases' search methods will use.
+3. Three attacks: `ChannelNoiseAttack`, `GeometrySpoofAttack`,
+   `PhantomActorAttack` (`avredteam_carla/attacks/{channel_noise,
+   geometry_spoof,phantom_actor}.py`), each unit-tested against synthetic
+   BEV tensors (`tests/test_attacks.py`) without needing CARLA.
+4. `avredteam_carla/attacks/hook.py` — monkeypatches
+   `RlBirdviewWrapper.process_obs` (the exact interception point) rather
+   than forking Roach's code.
+5. `avredteam_carla/run_clean_episode.py` — extended with `--attack` /
+   `--attack-param` / `--bev-frames-every`; the no-attack path is
+   unchanged from Phase 1.
+6. `avredteam_carla/compare_episodes.py` — deviation metrics (steering
+   sign-flips, speed/brake stats, paired control divergence) between two
+   episode logs.
+
+## Explicitly out of scope for this phase
+
+No search/optimization methods (random search, Bayesian opt, LLM agent) —
+that's Phase 4. No formal evaluator/severity scoring — that's Phase 3.
+
+## Git workflow
+
+- Branch: `phase-2-bev-attack-library`
+- PR titled "Phase 2: BEV-space sensor attack library", acceptance table
+  filled in with real Maui results. Do not merge without review.
+- Don't bulk-commit BEV frame PNGs — `.gitignore` already excludes
+  `logs/` (where `--bev-frames-every` writes them) except `.gitkeep`.

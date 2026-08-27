@@ -144,3 +144,70 @@ before trusting attack results):
   looked up on the class at call time, not bound early — but confirm with a
   trivial "does control change at all" smoke test before trusting any
   specific attack's numbers).
+
+## 6. Running Phase 2 on Maui
+
+Everything under `avredteam_carla/attacks/` and its unit tests
+(`tests/test_attacks.py`, `tests/test_visualize.py`,
+`tests/test_compare_episodes.py`) is pure Python/numpy and was already run
+and passing in the dev sandbox that wrote this PR — 40 tests, no CARLA
+needed. Re-running them on Maui is still worth doing once (confirms the
+Roach conda env's numpy/pytest work the same way), but the part that
+actually needs verifying here is the CARLA/Roach integration:
+
+```bash
+source /data/savyo/carla-redteam/env.sh   # same env as Phase 1
+cd ~/av-redteam-agent && git checkout phase-2-bev-attack-library
+
+pip install pytest   # if not already in the carla-redteam env
+python -m pytest tests/ -q   # should be 40 passed, same as the dev sandbox
+
+# CARLA server already running per docs/setup.md (launch_carla.sh)
+
+# 1. Baseline clean episode (Phase 1 behavior, unchanged)
+python -m avredteam_carla.run_clean_episode \
+  --roach-root "$PROJECT_DATA_DIR/roach" --host localhost --port 2100 \
+  --carla-map Town01 --weather-group simple --route-id 0 \
+  --out logs/phase2_clean.json
+
+# 2. One attacked episode per attack type
+python -m avredteam_carla.run_clean_episode \
+  --roach-root "$PROJECT_DATA_DIR/roach" --host localhost --port 2100 \
+  --carla-map Town01 --weather-group simple --route-id 0 \
+  --attack channel_noise --attack-param channel=1 --attack-param amplitude=100 --attack-param frequency_hz=2 \
+  --bev-frames-every 100 \
+  --out logs/phase2_channel_noise.json
+
+python -m avredteam_carla.run_clean_episode \
+  --roach-root "$PROJECT_DATA_DIR/roach" --host localhost --port 2100 \
+  --carla-map Town01 --weather-group simple --route-id 0 \
+  --attack geometry_spoof --attack-param max_offset_m=3 --attack-param ramp_ticks=30 \
+  --bev-frames-every 100 \
+  --out logs/phase2_geometry_spoof.json
+
+python -m avredteam_carla.run_clean_episode \
+  --roach-root "$PROJECT_DATA_DIR/roach" --host localhost --port 2100 \
+  --carla-map Town01 --weather-group simple --route-id 0 \
+  --attack phantom_actor --attack-param distance_m=15 --attack-param trigger_tick=50 \
+  --bev-frames-every 100 \
+  --out logs/phase2_phantom_actor.json
+
+# 3. Compare each attacked run against the clean baseline
+python -m avredteam_carla.compare_episodes --clean logs/phase2_clean.json --attacked logs/phase2_channel_noise.json
+python -m avredteam_carla.compare_episodes --clean logs/phase2_clean.json --attacked logs/phase2_geometry_spoof.json
+python -m avredteam_carla.compare_episodes --clean logs/phase2_clean.json --attacked logs/phase2_phantom_actor.json
+```
+
+For each run, check the log line `Attack hook fired on N/M ticks` — if
+`ticks_patched=0`, the monkeypatch didn't take effect and nothing else in
+that run is trustworthy; stop and re-open §5's open question before
+proceeding, don't just report the (meaningless) numbers.
+
+**TODO (fill in after running on Maui):** for each attack — did the hook
+fire on every tick, did the episode run start-to-finish with no crash/NaN,
+what `compare_episodes.py` reported (steer_sign_flips delta for
+channel-noise, mean_speed/max_brake delta for phantom-actor,
+mean_abs_steer_diff for geometry-spoof), and whether the saved
+`logs/bev_frames/<attack>/tick_*.png` pairs visually show the expected
+effect. Fill the acceptance table in the Phase 2 PR description with these
+real numbers, per attack.
