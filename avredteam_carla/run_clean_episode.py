@@ -37,6 +37,13 @@ instead of trusting a field that was never there.
 See docs/setup.md for full installation + the reasoning behind the CARLA
 0.9.11 (not 0.9.15) and birdview-not-camera decisions this script assumes.
 
+Phase 2 adds an optional attack: pass --attack NAME (see
+avredteam_carla.attacks.registry.ATTACK_REGISTRY for the available names)
+to run the *same* route through avredteam_carla.attacks.hook.install_attack()
+instead of unperturbed. Omitting --attack keeps this script's behavior
+byte-for-byte what Phase 1 verified: no hook installed, no import of
+anything under avredteam_carla.attacks even attempted.
+
 Usage:
     python -m avredteam_carla.run_clean_episode \\
         --roach-root /data/savyo/carla-redteam/roach \\
@@ -44,10 +51,20 @@ Usage:
         --wb-run-path iccv21-roach/trained-models/1929isj0 \\
         --carla-map Town01 --weather-group simple --route-id 0 \\
         --out logs/clean_episode.json
+
+    # with an attack, plus a handful of before/after BEV sanity-check PNGs:
+    python -m avredteam_carla.run_clean_episode \\
+        --roach-root /data/savyo/carla-redteam/roach \\
+        --host localhost --port 2000 \\
+        --carla-map Town01 --weather-group simple --route-id 0 \\
+        --attack phantom_actor --attack-param distance_m=12 --attack-param trigger_tick=50 \\
+        --bev-frames-every 100 \\
+        --out logs/attacked_episode.json
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import json
 import logging
@@ -99,7 +116,53 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out", required=True, help="Output log path (.json or .csv)")
     p.add_argument("--workdir", default=None, help="Scratch dir for wandb/checkpoint downloads (default: a temp dir)")
     p.add_argument("--debug-dump-info", action="store_true", help="Print the raw per-tick info dict once, for schema verification")
+    p.add_argument(
+        "--attack",
+        default=None,
+        help="Name from avredteam_carla.attacks.registry.ATTACK_REGISTRY (channel_noise, geometry_spoof, "
+        "phantom_actor). Omit for a clean, unperturbed episode (Phase 1 behavior, unchanged).",
+    )
+    p.add_argument(
+        "--attack-param",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Override one of the attack's tunable_params, e.g. --attack-param distance_m=12. Repeatable.",
+    )
+    p.add_argument(
+        "--bev-frames-dir",
+        default="logs/bev_frames",
+        help="Where to save before/after BEV sanity-check PNGs when --attack and --bev-frames-every are both set",
+    )
+    p.add_argument(
+        "--bev-frames-every",
+        type=int,
+        default=0,
+        help="Save a clean/attacked BEV PNG pair every N ticks (0 = disabled). Only meaningful with --attack.",
+    )
     return p.parse_args()
+
+
+def _parse_attack_param(raw: str):
+    """CLI values arrive as strings; TunableParam.cast() expects something
+    int()/float()/bool()-able. bool("false") is True in Python (any
+    non-empty string is truthy), so true/false needs handling before the
+    numeric attempts."""
+    key, _, value = raw.partition("=")
+    if not _:
+        raise ValueError(f"--attack-param must be KEY=VALUE, got {raw!r}")
+    lowered = value.strip().lower()
+    if lowered in ("true", "false"):
+        return key, lowered == "true"
+    try:
+        return key, int(value)
+    except ValueError:
+        pass
+    try:
+        return key, float(value)
+    except ValueError:
+        pass
+    return key, value
 
 
 def _write_seed_agent_config(path: Path, wb_run_path: str, wb_ckpt_step) -> None:
@@ -157,6 +220,26 @@ def _termination_reason(episode_event: dict) -> str:
     if episode_event.get("route_completion", {}).get("is_route_completed"):
         return "route_completed"
     return "unknown (see 'episode_event' in the output file for the raw buffers)"
+
+
+@contextlib.contextmanager
+def _null_context():
+    """Stand-in for install_attack() when no --attack is given, so the tick
+    loop's `with attack_cm as hook_handle:` doesn't need an if/else split
+    between the attack and no-attack paths."""
+    yield None
+
+
+def _save_bev_frame_pair(hook_handle, bev_frames_dir: Path, tick_idx: int) -> None:
+    """Writes tick_XXXXXX_clean.png / _attacked.png - the actual visual
+    sanity check the Phase 2 brief calls for, since this cluster run is
+    headless (no spectator view to eyeball otherwise)."""
+    from avredteam_carla.attacks.visualize import masks_to_rgb, save_png
+
+    clean_png = masks_to_rgb(hook_handle.last_clean_birdview)
+    attacked_png = masks_to_rgb(hook_handle.last_attacked_birdview)
+    save_png(clean_png, bev_frames_dir / f"tick_{tick_idx:06d}_clean.png")
+    save_png(attacked_png, bev_frames_dir / f"tick_{tick_idx:06d}_attacked.png")
 
 
 def _check_control_sane(tick: int, control) -> list[str]:
@@ -225,54 +308,95 @@ def main() -> int:
     warnings: list[str] = []
     termination_reason = "unknown"
 
+    # Build the attack (if any) before entering the env context - keeps the
+    # no-attack path from importing anything under avredteam_carla.attacks
+    # at all, so Phase 1's verified behavior is untouched when --attack is
+    # omitted.
+    attack = None
+    attack_cm = _null_context()
+    if args.attack:
+        from avredteam_carla.attacks.registry import build_attack
+        from avredteam_carla.attacks.hook import install_attack
+
+        attack_params = dict(_parse_attack_param(raw) for raw in args.attack_param)
+        attack = build_attack(args.attack, **attack_params)
+        log.info("Attack active: %r", attack)
+        attack_cm = install_attack(attack, args.roach_root)
+
+    bev_frames_dir = Path(args.bev_frames_dir) / (args.attack or "none")
+    if args.attack and args.bev_frames_every > 0:
+        bev_frames_dir.mkdir(parents=True, exist_ok=True)
+
     try:
         env.set_task_idx(args.route_id)  # pin an exact route deterministically, no shuffling
         log.info("Pinned task_idx=%d (task=%s)", args.route_id, env.task)
 
-        obs_dict = env.reset()
-        timestamp = env.timestamp
-        done_dict = {"__all__": False}
-        tick_idx = 0
-        final_episode_event = None
-
-        while not done_dict["__all__"] and tick_idx < args.max_steps:
-            control = agent.run_step(obs_dict[ACTOR_ID], timestamp)
-            # Zero perturbation: control is applied exactly as Roach produced it.
-            control_dict = {ACTOR_ID: control}
-
-            obs_dict, reward_dict, done_dict, info_dict = env.step(control_dict)
+        with attack_cm as hook_handle:
+            obs_dict = env.reset()
             timestamp = env.timestamp
+            done_dict = {"__all__": False}
+            tick_idx = 0
+            final_episode_event = None
 
-            if args.debug_dump_info and tick_idx == 0:
-                log.info("First tick raw info_dict[%s]: %s", ACTOR_ID, info_dict[ACTOR_ID])
+            while not done_dict["__all__"] and tick_idx < args.max_steps:
+                control = agent.run_step(obs_dict[ACTOR_ID], timestamp)
+                # No-attack path: control is applied exactly as Roach produced
+                # it (zero perturbation, per Phase 1). Attack path: control is
+                # still applied exactly as returned here - the attack already
+                # happened upstream, inside agent.run_step(), by transforming
+                # what Roach *perceived*, never by touching this control value.
+                control_dict = {ACTOR_ID: control}
 
-            warnings.extend(_check_control_sane(tick_idx, control))
+                obs_dict, reward_dict, done_dict, info_dict = env.step(control_dict)
+                timestamp = env.timestamp
 
-            events = _extract_events(info_dict[ACTOR_ID])
-            ticks.append(
-                {
-                    "tick": tick_idx,
-                    "sim_time": timestamp.get("relative_simulation_time"),
-                    "steer": control.steer,
-                    "throttle": control.throttle,
-                    "brake": control.brake,
-                    "reward": reward_dict.get(ACTOR_ID),
-                    "done": bool(done_dict.get(ACTOR_ID)),
-                    "collision_events": events["collision"],
-                    "outside_route_lane_events": events["outside_route_lane"],
-                }
-            )
+                if args.debug_dump_info and tick_idx == 0:
+                    log.info("First tick raw info_dict[%s]: %s", ACTOR_ID, info_dict[ACTOR_ID])
 
-            if done_dict.get(ACTOR_ID):
-                final_episode_event = info_dict[ACTOR_ID].get("episode_event", {})
-                termination_reason = _termination_reason(final_episode_event)
+                warnings.extend(_check_control_sane(tick_idx, control))
 
-            tick_idx += 1
+                events = _extract_events(info_dict[ACTOR_ID])
+                ticks.append(
+                    {
+                        "tick": tick_idx,
+                        "sim_time": timestamp.get("relative_simulation_time"),
+                        "steer": control.steer,
+                        "throttle": control.throttle,
+                        "brake": control.brake,
+                        "reward": reward_dict.get(ACTOR_ID),
+                        "done": bool(done_dict.get(ACTOR_ID)),
+                        "collision_events": events["collision"],
+                        "outside_route_lane_events": events["outside_route_lane"],
+                    }
+                )
 
-        if tick_idx >= args.max_steps and not done_dict["__all__"]:
-            termination_reason = "max_steps_reached"
+                if (
+                    args.attack
+                    and args.bev_frames_every > 0
+                    and tick_idx % args.bev_frames_every == 0
+                    and hook_handle.last_attacked_birdview is not None
+                ):
+                    _save_bev_frame_pair(hook_handle, bev_frames_dir, tick_idx)
 
-        final_stat = info_dict[ACTOR_ID].get("episode_stat") if ticks else None
+                if done_dict.get(ACTOR_ID):
+                    final_episode_event = info_dict[ACTOR_ID].get("episode_event", {})
+                    termination_reason = _termination_reason(final_episode_event)
+
+                tick_idx += 1
+
+            if tick_idx >= args.max_steps and not done_dict["__all__"]:
+                termination_reason = "max_steps_reached"
+
+            final_stat = info_dict[ACTOR_ID].get("episode_stat") if ticks else None
+
+            if args.attack:
+                if hook_handle.ticks_patched == 0:
+                    log.warning(
+                        "Attack hook never fired (ticks_patched=0) - the monkeypatch may not be "
+                        "taking effect. See docs/attacks.md #5 before trusting this run's results."
+                    )
+                else:
+                    log.info("Attack hook fired on %d/%d ticks", hook_handle.ticks_patched, len(ticks))
 
     finally:
         # Always clean up actors/world state, even on failure.
@@ -293,6 +417,11 @@ def main() -> int:
             "final_episode_stat": final_stat,
             "final_episode_event": final_episode_event,
             "run_timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "attack": (
+                {"name": args.attack, "params": attack.param_summary()}
+                if attack is not None
+                else None
+            ),
         },
         "ticks": ticks,
     }
