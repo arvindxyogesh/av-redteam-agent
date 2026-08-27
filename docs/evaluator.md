@@ -44,7 +44,18 @@ parameter, not a flaw in how `chattering_rate` samples the control signal
 control loop). **Recommendation for future verification runs**: keep
 `channel_noise`'s `frequency_hz` at or below ~3Hz so the injected raster
 oscillation itself is unambiguously resolved, independent of anything this
-evaluator does. This is a distinct failure mode from Phase 2's actual bug
+evaluator does.
+
+**Interpreting the magnitude, not just presence, of `chattering_rate`**: a
+clean sinusoidal rate only flips sign near its own zero-crossings (~2 times
+per cycle), not on every sample — a 2Hz oscillation at 10Hz (~5
+samples/cycle) gives `chattering_rate ≈ 2/5 = 0.4`, confirmed numerically
+in `tests/test_evaluator.py`, not something close to 1.0. A rate that
+reverses on literally every tick (`chattering_rate = 1.0`) is a *choppier*
+signal than a smooth low-frequency oscillation, not a stricter version of
+it. Both are clearly distinguishable from a monotonic/flat trace
+(`chattering_rate = 0.0`) — that binary distinction, not the exact
+magnitude, is what the aliasing argument above actually needs to hold. This is a distinct failure mode from Phase 2's actual bug
 (that one was an extra, avoidable sampling interval — `--bev-frames-every`
 — coinciding with the attack period; `chattering_rate` has no such extra
 interval to alias against, since it consumes the raw tick series directly).
