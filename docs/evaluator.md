@@ -491,3 +491,56 @@ should stop); (3) a longer client-side timeout than CARLA's 60s default is
 worth considering if this node runs loaded like this regularly; (4) the
 near-full disk found here is a real, fixable condition independent of any
 of the above and worth addressing on its own merits.
+
+#### Follow-up confirmation: same crash reproduces on a different, idle GPU
+
+The bare-client repro above narrowed the cause to "infrastructure
+contention," but didn't rule out one remaining GPU-specific alternative:
+the CARLA server had been running on GPU 3 (Docker `--gpus device=3`) for
+the entire session, and at the time of the original investigation GPU 3
+happened to be at 90%+ utilization and near its power cap, driven by
+another user's Ray/VLLM RL training job. That's a plausible independent
+explanation for slow/hanging RPC calls (a Vulkan-rendering process sharing
+compute with a job pinned near its ceiling), so it needed to be tested
+directly rather than assumed away.
+
+**Experiment**: killed the GPU-3 CARLA container, relaunched an identical
+one on GPU 1 (confirmed idle: 0% utilization, 0MiB used, via `nvidia-smi`
+immediately before launch), and re-ran the full `verify_phase3.py` command
+against it from scratch - baseline, all three attacks, then the 6-call
+stability check.
+
+**Result: the crash reproduced identically.** Baseline needed one retry
+(`load_world()` timed out on attempt 1, even on this freshly-idle GPU,
+succeeded on attempt 2 - already covered by `STAGE_SUBPROCESS_RETRIES`);
+all three attacks then completed cleanly with metrics matching the GPU-3
+run almost exactly (baseline `severity_score=16.13`, `channel_noise=56.70`,
+`geometry_spoof=66.08`, `phantom_actor=13.83` - same values to 2+ decimal
+places, confirming the underlying episodes are deterministic runs of the
+same scenario/seed rather than something GPU-dependent). The stability
+check then followed the exact same pattern as the GPU-3 run: call 1/6
+succeeded (639.9s, 3104 ticks, `actor_count_after_close=173`,
+`rss=632540kB` - all in the same ballpark as GPU-3's call 1), call 2/6
+aborted with the identical uncaught
+`terminate called after throwing an instance of 'carla::client::TimeoutException'`
+/ `time-out of 60000ms while waiting for the simulator`, killing the whole
+process (nothing left in `ps aux` afterward).
+
+Two host-level numbers, checked immediately after the crash: the root
+filesystem was now at **99% full (9.1GB free of 879GB, down from ~20GB at
+the time of the original investigation)**, and load average was
+**11.06 / 16.50 / 17.18 (up from ~7.6 / 10.4 / 11.7)**. Both got worse over
+the course of this session, not better.
+
+**This settles the open question**: the crash is not tied to GPU 3
+specifically, and moving to a different, genuinely idle GPU does not fix
+it. Combined with the bare-client repro (correct teardown sequence, still
+times out; RPC calls 20x slower than normal), this is consistent
+end-to-end with a single explanation - **shared-node resource pressure
+(disk near-full and/or CPU load, both independently observable and both
+trending worse), not a `carla_gym`/project-code bug, and not anything
+specific to which GPU the CARLA server is bound to.** The Phase 4
+recommendations above (subprocess-per-trial isolation, retry-with-backoff,
+longer client timeout) stand unchanged; "restart the CARLA server on a
+different/idle GPU" is now specifically ruled out as a fix - the recurring
+crash follows the node's overall load, not the GPU assignment.
