@@ -15,15 +15,101 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import logging
 import resource
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("verify_phase3")
+
+# Real finding from this Maui run, not a hypothetical: this script creates
+# several LeaderBoard-v0 envs back-to-back *within one process* (baseline,
+# then each attack, then N stability-check trials) - a pattern Phase 1/2
+# never exercised (their CLI always made exactly one env per process).
+# CarlaMultiAgentEnv.close() (carla_multi_agent_env.py) only nils out its
+# own self._client/self._tm references; the handler objects it owns
+# (_ev_handler, _zv_handler, etc.) still hold direct references to the same
+# carla.Client/TrafficManager, so the underlying connection/RPC threads
+# aren't necessarily torn down by the time close() returns. The very next
+# gym.make() in the same process (creating a second client to the same
+# host:port) hung until CARLA's client-side 60s timeout three times in a
+# row on this Maui node, and that specific timeout escapes as an *uncaught*
+# C++ exception (`terminate called after throwing
+# carla::client::TimeoutException`) that aborts the whole process (exit
+# 134) - not a catchable Python RuntimeError like the already-known
+# intermittent load_world() flakiness from Phase 1/2. No amount of
+# Python-side try/except fixes an abort of the process itself. A 8s
+# gc.collect()+sleep settle delay (still applied below, cheap insurance)
+# was NOT enough to fix it by itself - confirmed by still hitting the exact
+# same crash with it in place. The actual fix: baseline and each attack
+# below now each run in their own freshly-spawned subprocess (self-
+# reinvocation via `--_stage`), since a process exit trivially and
+# completely tears down every socket/thread/GPU context - the same
+# process-per-episode shape Phase 1/2's CLI always used and which never hit
+# this bug. The repeated-call stability check deliberately keeps its N
+# calls genuinely in-process, unlike baseline/attacks - that in-process
+# repetition is exactly what it exists to test for Phase 4's future search
+# loops, so isolating it into subprocesses would make it pass trivially and
+# defeat its purpose.
+SETTLE_SLEEP_S = 8.0
+STAGE_SUBPROCESS_RETRIES = 3
+
+
+def _settle_after_env_close() -> None:
+    gc.collect()
+    time.sleep(SETTLE_SLEEP_S)
+
+
+def _unlink_if_exists(path: Path) -> None:
+    # Path.unlink(missing_ok=True) is Python 3.8+ only; this env is 3.7.
+    if path.exists():
+        path.unlink()
+
+
+def _run_stage_in_subprocess(stage: str, cli_args: argparse.Namespace) -> dict:
+    """Runs one stage (baseline or a named attack) in a fresh subprocess by
+    re-invoking this same module with --_stage, and returns that stage's
+    result dict (EpisodeMetrics.to_dict(), or Trial.to_dict() for an
+    attack). Retries a bounded number of times on failure (covers both the
+    ordinary intermittent load_world() timeout and, since each attempt is
+    its own fresh process, the cross-episode issue this function exists to
+    avoid can't recur within a single attempt either)."""
+    last_error = None
+    for attempt in range(1, STAGE_SUBPROCESS_RETRIES + 1):
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            stage_out = Path(f.name)
+        cmd = [
+            sys.executable, "-m", "avredteam_carla.verify_phase3",
+            "--roach-root", cli_args.roach_root,
+            "--host", cli_args.host,
+            "--port", str(cli_args.port),
+            "--carla-map", cli_args.carla_map,
+            "--weather-group", cli_args.weather_group,
+            "--route-id", str(cli_args.route_id),
+            "--out", str(stage_out),
+            "--_stage", stage,
+        ]
+        log.info("[%s attempt %d/%d] spawning subprocess: %s", stage, attempt, STAGE_SUBPROCESS_RETRIES, " ".join(cmd))
+        proc = subprocess.run(cmd)
+        if proc.returncode == 0 and stage_out.exists():
+            try:
+                return json.loads(stage_out.read_text())
+            finally:
+                _unlink_if_exists(stage_out)
+        last_error = f"subprocess for stage {stage!r} exited {proc.returncode}"
+        if attempt < STAGE_SUBPROCESS_RETRIES:
+            log.warning("%s (attempt %d/%d) - retrying", last_error, attempt, STAGE_SUBPROCESS_RETRIES)
+        else:
+            log.warning("%s - out of retries", last_error)
+        _unlink_if_exists(stage_out)
+        _settle_after_env_close()
+    raise RuntimeError(last_error)
 
 # Same params Phase 2 actually verified against real hardware (docs/attacks.md
 # #6) - reusing them here means Phase 3's numeric metrics can be checked
@@ -47,8 +133,18 @@ def run_stability_check(scenario, n_calls: int, log_dir: Path) -> dict:
     """docs/evaluator.md #8 / Phase 3 brief Step 4: run_trial() back-to-back
     n_calls times, confirm no actor leak (world actor count returns to a
     stable baseline after each call's env.close()) and no runaway timing/
-    memory growth across repeats."""
+    memory growth across repeats.
+
+    Writes each call's result to log_dir/phase3_stability_partial.json as it
+    goes, not just at the end: this loop runs genuinely in-process (that's
+    the point - see docs/evaluator.md's stability-check section), and a
+    real run on Maui found it can abort the whole process outright partway
+    through. Without incremental writes, a crash on e.g. call 2 would
+    discard call 1's already-good data along with it.
+    """
     from avredteam_carla.runner import run_trial
+
+    partial_path = Path(log_dir) / "phase3_stability_partial.json"
 
     results = []
     for i in range(n_calls):
@@ -76,6 +172,9 @@ def run_stability_check(scenario, n_calls: int, log_dir: Path) -> dict:
             "Stability call %d/%d: %.1fs, %d ticks, actor_count_after_close=%d, rss=%dkB",
             i + 1, n_calls, elapsed_s, trial.metrics.n_ticks, actor_count, rss_after_kb,
         )
+        partial_path.parent.mkdir(parents=True, exist_ok=True)
+        partial_path.write_text(json.dumps({"n_calls_completed": i + 1, "calls": results}, indent=2, default=str))
+        _settle_after_env_close()
 
     actor_counts = [r["actor_count_after_close"] for r in results]
     elapsed_times = [r["elapsed_s"] for r in results]
@@ -100,9 +199,16 @@ def main() -> int:
     p.add_argument("--stability-calls", type=int, default=6, help="How many back-to-back run_trial calls for the leak check")
     p.add_argument("--skip-stability", action="store_true", help="Skip the repeated-call stability check")
     p.add_argument("--out", required=True)
+    # Hidden worker-mode flag: run_stage_in_subprocess() re-invokes this same
+    # module with this set to run exactly one stage and exit - see the
+    # module-level comment on SETTLE_SLEEP_S for why baseline/attacks each
+    # need their own fresh process.
+    p.add_argument("--_stage", default=None, help=argparse.SUPPRESS)
     args = p.parse_args()
 
     from avredteam_carla.runner import ScenarioConfig, run_baseline, run_trial
+    from avredteam_carla.evaluator import EpisodeMetrics
+    from avredteam_carla.agents.campaign import Trial
 
     scenario = ScenarioConfig(
         name=f"{args.carla_map}_{args.weather_group}_route{args.route_id}",
@@ -114,33 +220,65 @@ def main() -> int:
         route_id=args.route_id,
     )
 
-    log.info("Running baseline...")
-    baseline_metrics = run_baseline(scenario)
-    log.info("Baseline: %s", baseline_metrics.to_dict())
+    if args._stage:
+        # Worker mode: run exactly one stage, write its dict, exit. No
+        # table printing, no stability check - the parent process handles
+        # all of that after collecting every stage's subprocess output.
+        if args._stage == "baseline":
+            stage_result = run_baseline(scenario).to_dict()
+        else:
+            attack_params = dict(ATTACK_RUNS)[args._stage]
+            stage_result = run_trial(scenario, args._stage, attack_params).to_dict()
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.out).write_text(json.dumps(stage_result, indent=2, default=str))
+        return 0
+
+    log.info("Running baseline (in a fresh subprocess)...")
+    baseline_dict = _run_stage_in_subprocess("baseline", args)
+    baseline_metrics = EpisodeMetrics(**baseline_dict)
+    log.info("Baseline: %s", baseline_dict)
 
     trials = []
     for attack_name, attack_params in ATTACK_RUNS:
-        log.info("Running attack %s params=%s ...", attack_name, attack_params)
-        trial = run_trial(scenario, attack_name, attack_params)
-        log.info("%s: %s", attack_name, trial.metrics.to_dict())
+        log.info("Running attack %s params=%s (in a fresh subprocess)...", attack_name, attack_params)
+        trial_dict = _run_stage_in_subprocess(attack_name, args)
+        trial = Trial(
+            scenario_name=trial_dict["scenario_name"],
+            attack_name=trial_dict["attack_name"],
+            attack_params=trial_dict["attack_params"],
+            metrics=EpisodeMetrics(**trial_dict["metrics"]),
+        )
+        log.info("%s: %s", attack_name, trial_dict["metrics"])
         trials.append(trial)
+
+    def _write_result(stability_value) -> dict:
+        result = {
+            "scenario": scenario.name,
+            "baseline_metrics": baseline_metrics.to_dict(),
+            "trials": [t.to_dict() for t in trials],
+            "stability_check": stability_value,
+        }
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(result, indent=2, default=str))
+        return result
+
+    # Written *before* the stability check, not just after: that check
+    # deliberately runs several envs genuinely in-process (see below) and
+    # can abort the whole process outright - confirmed on this Maui run,
+    # not a hypothetical. Without this, that abort would silently discard
+    # the baseline + all three attacks' already-good results along with it,
+    # since nothing had been written to --out yet.
+    _write_result(stability_value=None)
+    log.info("Wrote baseline+attack results to %s (stability check not yet run)", args.out)
 
     stability = None
     if not args.skip_stability:
         log.info("Running repeated-call stability check (%d calls)...", args.stability_calls)
         stability = run_stability_check(scenario, args.stability_calls, Path(args.out).parent)
 
-    result = {
-        "scenario": scenario.name,
-        "baseline_metrics": baseline_metrics.to_dict(),
-        "trials": [t.to_dict() for t in trials],
-        "stability_check": stability,
-    }
-
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(result, indent=2, default=str))
-    log.info("Wrote verification results to %s", out_path)
+    result = _write_result(stability_value=stability)
+    log.info("Wrote verification results to %s", args.out)
 
     # Print the acceptance table directly, so it can be pasted straight
     # into docs/evaluator.md / the PR description.

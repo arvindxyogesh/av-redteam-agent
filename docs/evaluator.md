@@ -264,32 +264,160 @@ params Phase 2 already verified — `docs/attacks.md` §6), the repeated-call
 stability check, and prints the acceptance table directly to stdout (also
 written to `logs/phase3_verification.json` in full).
 
-**TODO (fill in after running on Maui):**
-- Paste the printed acceptance table below, with real numbers.
-- Confirm the numeric pattern matches Phase 2's qualitative findings:
-  `geometry_spoof` should show an earlier `time_to_collision_s` and higher
-  `mean_brake` than `channel_noise`; `phantom_actor` should show a sharp
-  `max_brake_rate` spike concentrated near its trigger tick rather than a
-  high `mean_brake` overall; `channel_noise` should show a higher
-  `chattering_rate`/`max_steering_jerk` than the other two, consistent with
-  it being the oscillation/noise attack.
-- Report the stability-check numbers explicitly:
-  `actor_count_range`/`actor_count_stable` and `elapsed_s_range`/
-  `timing_stable` from the script's output — a real pass/fail on "no actor
-  leak or degradation across repeated run_trial calls", not just "it ran."
-- Confirm §1's aliasing argument against the real `channel_noise` run's
-  actual `chattering_rate` number — does it land in the expected ballpark
-  for a `frequency_hz=2.0` oscillation sampled at 10Hz (see the note in §1
-  about a clean sinusoid giving ≈0.4, not ≈1.0), or does the real (noisier,
-  policy-filtered) signal look different enough to be worth another look?
+**What it took to get a real run**, beyond the metric logic itself (all pure
+Python, unit-tested, unchanged by the real run): two genuine integration
+bugs and one process-architecture issue, none catchable without a live
+CARLA server —
+
+1. **`env._ev_handler`/`env._world` raised `AttributeError: attempted to get
+   missing private attribute`.** The object `gym.make()` returns is wrapped
+   in a `gym.core.Wrapper` (`OrderEnforcing`, applied automatically since
+   `LeaderBoard-v0` sets no `max_episode_steps` — confirmed by reading
+   `gym/envs/registration.py`'s `EnvSpec.make()`), and `Wrapper.__getattr__`
+   explicitly refuses to forward any underscore-prefixed attribute, even
+   though the real `CarlaMultiAgentEnv` underneath genuinely has both.
+   Fixed in `run_clean_episode.py` by reaching through gym's own standard
+   escape hatch, `env.unwrapped`, instead.
+2. **`raw_env._ev_handler.ego_vehicles[ACTOR_ID]` raised `KeyError: 'hero'`.**
+   `EgoVehicleHandler.ego_vehicles` is an empty dict until
+   `CarlaMultiAgentEnv.reset()` populates it (confirmed in
+   `ego_vehicle_handler.py`) - the ground-truth accessor setup was placed
+   before `env.reset()`, not after. Fixed by moving it inside the
+   `with attack_cm as hook_handle:` block, after `obs_dict = env.reset()`.
+3. **A process-architecture issue specific to this script, not to the
+   metrics/plumbing being verified**: `verify_phase3.py` originally created
+   the baseline env, then each attack's env, back-to-back *in one process*.
+   `CarlaMultiAgentEnv.close()` only nils out its own `self._client`/
+   `self._tm`; the handler objects it owns (`_ev_handler`, `_zv_handler`,
+   etc.) still hold direct references to the same `carla.Client`/
+   `TrafficManager`, so the connection isn't necessarily torn down by the
+   time `close()` returns. The very next `gym.make()` in the same process
+   hit CARLA's 60s client-side timeout, and — unlike the already-known
+   intermittent `load_world()` flakiness from Phase 1/2, which raises a
+   catchable Python `RuntimeError` — this specific timeout escaped as an
+   **uncaught C++ exception** (`terminate called after throwing
+   carla::client::TimeoutException`) that aborts the whole process (exit
+   134). No amount of Python-side `try`/`except` fixes a process abort. A
+   `gc.collect()` + sleep settle delay between episodes was not sufficient
+   by itself (confirmed - still crashed with an 8s delay in place). The fix
+   that actually worked: baseline and each attack now each run in their own
+   freshly-spawned subprocess (`verify_phase3.py` re-invokes itself with a
+   hidden `--_stage` flag), since a process exit trivially and completely
+   tears down every socket/thread/GPU context - the same process-per-episode
+   shape Phase 1/2's CLI always used, which never hit this bug. Each
+   subprocess attempt is also retried up to 3 times automatically, absorbing
+   the ordinary intermittent flakiness without manual intervention.
+   **The repeated-call stability check deliberately does *not* get this
+   treatment** - see below, since testing genuine in-process repetition is
+   the entire point of that check.
 
 ### Acceptance table — real results from this node
 
-*(fill in from `verify_phase3.py`'s printed output)*
+All four ran Town01/`simple`(ClearNoon)/route 0, GPU 3, same checkpoint/seed
+as Phase 1/2 - `channel_noise`/`geometry_spoof`/`phantom_actor` use the exact
+params Phase 2 already verified (`docs/attacks.md` §6). Hook fire rate was
+100% on all three attacks (`2682/2682`, `1355/1355`, `2676/2676`) - same
+finding as Phase 2, now cross-checked through the new evaluator path too.
 
 | Condition | Severity | Chattering rate | Max jerk | Time-to-collision (or "completed") | Max brake |
 |---|---|---|---|---|---|
-| Baseline (clean) | | | | | |
-| channel_noise | | | | | |
-| geometry_spoof | | | | | |
-| phantom_actor | | | | | |
+| Baseline (clean) | 16.1 | 0.484 | 21.67 | n/a | 1.00 |
+| channel_noise | 56.7 | 0.579 | 58.47 | 268.1s | 1.00 |
+| geometry_spoof | 66.1 | 0.447 | 11.57 | 135.4s | 1.00 |
+| phantom_actor | 13.9 | 0.516 | 22.40 | n/a | 1.00 |
+
+**Confirms Phase 2's qualitative pattern, with one genuine nuance worth
+flagging rather than glossing over:**
+
+- `geometry_spoof` collided **earlier** (135.4s vs. `channel_noise`'s
+  268.1s) **and** with **far higher** `mean_brake` (0.775 vs.
+  `channel_noise`'s 0.384, vs. baseline's own 0.407) — both halves of the
+  predicted pattern hold cleanly.
+- `phantom_actor` did **not** collide (matches Phase 2's non-collision
+  outcome for this exact scenario exactly - even `n_ticks=2676` is
+  identical) and has the **lowest** `severity_score` (13.9, below even
+  baseline's 16.1) - consistent with "a sharp reactive stop, not a
+  sustained failure."
+- `channel_noise` **is** the highest-`chattering_rate` condition (0.579),
+  confirming the predicted direction, **but the margin over baseline is
+  smaller than expected and `phantom_actor` sits closer behind than
+  `geometry_spoof`** (0.579 vs. 0.516 vs. 0.484 vs. 0.447) - not the clean,
+  wide separation the qualitative description implied. `max_steering_jerk`
+  is the metric that actually delivers the sharp, unambiguous signal §1
+  wanted: `channel_noise`'s 58.47 is **2.6x** `phantom_actor`'s, **2.7x**
+  baseline's, and **5.1x** `geometry_spoof`'s - the "abrupt, oscillating
+  steering" signature is real and strong, it just shows up far more
+  clearly in jerk than in the coarser sign-flip-rate metric on a real
+  (policy-filtered, not idealized-sinusoid) control trace.
+- **A real finding for `max_brake_rate`, not previously anticipated: it's
+  identical (1.0/0.1 = 10.0, the theoretical ceiling for a single-tick
+  brake-from-0-to-1) across *all four* conditions, including baseline.**
+  §5 hoped this field would distinguish `phantom_actor`'s sharp emergency
+  stop from `geometry_spoof`'s sustained heavy braking; in practice, some
+  tick somewhere in every one of these episodes (even the unperturbed
+  baseline) applies full brake within a single 0.1s step, saturating the
+  metric identically everywhere. `mean_brake` and `time_to_collision_s` are
+  what's actually doing the discriminating work in this table -
+  `max_brake_rate` as currently defined isn't a useful per-attack signal on
+  this checkpoint/route, whatever its value turns out to be.
+
+**§1's aliasing argument, checked against the real number**: baseline's own
+`chattering_rate` (0.484, no attack at all) already exceeds the ≈0.4
+estimate §1 derived for an idealized clean 2Hz/10Hz sinusoid — Roach's own
+PPO policy produces meaningfully noisy tick-to-tick steering even
+unattacked, which the idealized-sinusoid estimate didn't account for (it
+was never meant to model the baseline, only to sanity-check that
+`channel_noise`'s injected oscillation itself wouldn't be lost to
+aliasing). `channel_noise`'s 0.579 is still the highest value observed and
+still far from the "every tick flips" ceiling of 1.0, so the qualitative
+claim in §1 (Nyquist-safe, not close to 1.0) holds; the quantitative "≈0.4"
+reference point undersells the real signal specifically because it ignored
+policy-level noise, not because of any aliasing problem with the metric
+itself.
+
+### Stability check — real result: NOT stable, a genuine finding
+
+`run_stability_check()` deliberately runs its `n_calls` `run_trial()` calls
+genuinely in-process (unlike baseline/the three attacks above) - Phase 4's
+future search methods will do exactly this, hundreds of times in a loop, so
+testing anything *except* real in-process repetition would answer the wrong
+question.
+
+**Call 1/6 completed cleanly with real data**: 3104 ticks, 677.1s wall
+time, `actor_count_after_close=173`, RSS 658,716kB, hook fired on all 3104
+ticks. **Call 2/6 then hit the exact same uncaught C++ exception** described
+above (`terminate called after throwing carla::client::TimeoutException`,
+exit 134) - the whole process aborted mid-check, losing everything that
+hadn't already been written to disk.
+
+This is the real, load-bearing result of running this check for real rather
+than assuming: **back-to-back in-process `run_trial()` calls are not
+reliably stable on this node.** One clean call, then an abort on the very
+next one, with no code change in between - the same class of failure
+`verify_phase3.py`'s own baseline→attack transition hit (§8), now
+reproduced in exactly the repeated-call pattern this check exists to probe.
+Three independent isolated reruns of just this check (same scenario, same
+6-call loop, no other changes) were each killed by unrelated session
+interruptions before completing even call 1 - none reached far enough to
+either confirm or contradict the single data point above, so it stands as
+the one real, complete observation from this node rather than an average
+over several runs.
+
+**What this means for Phase 4, concretely**: a search loop that calls
+`run_trial()` in a plain Python `for` loop, the way `run_stability_check()`
+does, should expect an occasional full-process abort that a
+`try`/`except` around the call cannot catch (it's a C++-level `terminate`,
+not a Python exception). The mitigation that already proved itself in
+`verify_phase3.py`'s own baseline/attack stages - running each trial in its
+own subprocess, so a crash costs one trial's worth of work instead of the
+whole campaign - is the same fix Phase 4's runner will need, not something
+Phase 3 should retrofit into `run_trial()`/`run_stability_check()`
+themselves (their job is testing/exposing this, not architecting Phase 4's
+eventual campaign loop around it).
+
+`actor_count_stable`/`timing_stable` (the boolean pass/fail fields
+`run_stability_check()` computes) were never reached for this run - the
+process aborted before the loop could finish and compute them. That
+itself is the honest acceptance-table entry for this check: not "stable"
+or "unstable" by those two booleans, but "crashed on call 2/6," which is a
+more informative result than either boolean would have been.

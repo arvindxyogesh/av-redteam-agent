@@ -366,18 +366,29 @@ def run_episode(
         env.set_task_idx(route_id)  # pin an exact route deterministically, no shuffling
         log.info("Pinned task_idx=%d (task=%s)", route_id, env.task)
 
-        # Ground-truth accessors (docs/evaluator.md #3/#6): the real
-        # TaskVehicle (exposes .vehicle.get_location() and
-        # .get_route_transform()) and the real carla.Map/World, all
-        # independent of anything an attack does to the policy's perceived
-        # BEV input.
-        ego_task_vehicle = env._ev_handler.ego_vehicles[ACTOR_ID]
-        carla_map_obj = env._world.get_map()
-        ego_actor_id = ego_task_vehicle.vehicle.id
+        # `env` (the object gym.make() returns) is wrapped in a
+        # gym.core.Wrapper, whose __getattr__ explicitly refuses to forward
+        # underscore-prefixed attributes ("attempted to get missing private
+        # attribute") even though the real CarlaMultiAgentEnv underneath has
+        # them - confirmed on a real run, not a hypothetical. `.unwrapped` is
+        # gym's own standard escape hatch for exactly this.
+        raw_env = env.unwrapped
 
         with attack_cm as hook_handle:
             obs_dict = env.reset()
             timestamp = env.timestamp
+
+            # Ground-truth accessors (docs/evaluator.md #3/#6): the real
+            # TaskVehicle (exposes .vehicle.get_location() and
+            # .get_route_transform()) and the real carla.Map/World, all
+            # independent of anything an attack does to the policy's
+            # perceived BEV input. Must come after env.reset(), not before -
+            # confirmed on a real run: EgoVehicleHandler.ego_vehicles is only
+            # populated inside CarlaMultiAgentEnv.reset() (empty at
+            # __init__), so reading it earlier raises KeyError.
+            ego_task_vehicle = raw_env._ev_handler.ego_vehicles[ACTOR_ID]
+            carla_map_obj = raw_env._world.get_map()
+            ego_actor_id = ego_task_vehicle.vehicle.id
             done_dict = {"__all__": False}
             tick_idx = 0
             final_episode_event = None
@@ -422,7 +433,7 @@ def run_episode(
                 lateral_offset_m = compute_lateral_offset_m(ego_task_vehicle)
                 lane_half_width_m = compute_lane_half_width_m(carla_map_obj, ego_location)
                 nearest_actor_distance_m = compute_nearest_actor_distance_m(
-                    env._world, ego_location, ego_actor_id
+                    raw_env._world, ego_location, ego_actor_id
                 )
 
                 ticks.append(
