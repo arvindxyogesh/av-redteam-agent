@@ -421,3 +421,73 @@ process aborted before the loop could finish and compute them. That
 itself is the honest acceptance-table entry for this check: not "stable"
 or "unstable" by those two booleans, but "crashed on call 2/6," which is a
 more informative result than either boolean would have been.
+
+#### Root-cause investigation: is this a `carla_gym`/our-code bug, or infrastructure?
+
+Pushed on directly rather than left as "subprocess isolation fixes it, don't
+ask why" - two follow-up experiments, both bypassing Roach/`carla_gym`
+entirely (bare `carla.Client` + `carla.World` + `carla.TrafficManager`
+calls), to isolate whether the repeated-`load_world()` hang is something in
+this project's code, in `carla_gym`, or neither:
+
+1. **First bare-client repro**: two sessions back-to-back in one process
+   (connect, spawn one vehicle, tick 10x, destroy, drop references,
+   `gc.collect()`). Session 1 itself hung indefinitely partway through
+   teardown - never even reached session 2. Root cause of *that* specific
+   hang: my own repro bug, not a real finding - it desynced the world
+   (`settings.synchronous_mode = False`) without also desyncing the traffic
+   manager (`tm.set_synchronous_mode(False)`), unlike `carla_multi_agent_env.py`'s
+   real `set_sync_mode()`, which always does both together. Worth recording
+   precisely because it shows how easy it is to manufacture a *fake* hang
+   here that looks identical from the outside - the real investigation
+   needed the corrected version below, not this one.
+2. **Corrected repro**, matching `close()`'s exact real sequence (destroy
+   actors → `world.tick()` → desync world settings → desync TM separately)
+   and giving the TM real work (30 zombie vehicles under
+   `set_autopilot(True, tm_port)`, not zero): **session 1's entire close
+   sequence completed successfully this time** - every step succeeded, just
+   abnormally slowly (`actors destroyed + ticked`: 20.0s; `world desync`:
+   21.9s - both normally sub-second RPC calls). **Session 2 then still hit
+   the 60s `load_world()` timeout**, this time as the ordinary catchable
+   Python `RuntimeError`, not an uncaught C++ abort (the abort appears to be
+   nondeterministic across otherwise-identical timeout scenarios, not tied
+   to a specific code path).
+
+At the same time, this node's `df -h /` showed the root filesystem at 98%
+capacity (20GB free of 879GB) and `uptime` showed a load average around 13
+- both checked directly while the repro was running, not retrospectively.
+
+**Conclusion: this looks like infrastructure contention on a heavily-loaded
+shared node, not a logic bug in `carla_gym`'s teardown or in this project's
+code.** The evidence against a code-level bug specifically: (a) the
+*correct* teardown sequence, verified line-for-line against
+`carla_multi_agent_env.py`, still hit the same timeout; (b) individual RPC
+calls that are normally near-instant took 20+ seconds; (c) a `gc.collect()`
+forced *before* the second session (§8's earlier settle-delay experiment)
+didn't help, which is what you'd expect if the bottleneck is the CARLA
+*server's* own responsiveness under load rather than a lingering Python
+object graph on the client side. None of this rules out an actual
+`carla_gym`/CARLA-level resource-release bug entirely - only a clean run
+under low load would fully separate the two - but "the whole node is under
+heavy, independently-observable load" already explains every symptom
+without needing to assume one.
+
+**What this means for Phase 4, revised**: "restart the CARLA server process
+every N trials" would only help if the server itself were accumulating
+state across trials that a restart clears - plausible, but not what this
+investigation actually points to. What it does point to is that
+`load_world()` (and other RPC calls) can legitimately need much longer than
+60s on a busy shared node, independent of trial count. The concrete
+recommendations: (1) keep the subprocess-per-trial isolation already
+proven in `verify_phase3.py` - it doesn't address a root cause this
+investigation found, but it does bound the blast radius of any single
+timeout to one trial rather than a whole campaign, which is valuable
+regardless of cause; (2) make trial-running code retry-with-backoff around
+transient timeouts (already true for `verify_phase3.py`'s baseline/attack
+subprocesses via `STAGE_SUBPROCESS_RETRIES`, not yet true for a bare
+`run_trial()` call - Phase 4's runner should build that in from the start
+rather than assume a call either fully succeeds or the whole campaign
+should stop); (3) a longer client-side timeout than CARLA's 60s default is
+worth considering if this node runs loaded like this regularly; (4) the
+near-full disk found here is a real, fixable condition independent of any
+of the above and worth addressing on its own merits.
