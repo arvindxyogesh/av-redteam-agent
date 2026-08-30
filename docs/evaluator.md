@@ -472,6 +472,27 @@ under low load would fully separate the two - but "the whole node is under
 heavy, independently-observable load" already explains every symptom
 without needing to assume one.
 
+**Disk attribution, checked directly rather than assumed**: three
+candidate sources of the near-full root filesystem were each ruled out -
+CARLA's shader cache (`carla_home_gpu1`/`carla_home_gpu3` under
+`$PROJECT_DATA_DIR/cache`) is 8K/52K, negligible; the CARLA Docker
+container's own log file is 390 bytes (and Docker's data-root is
+configured at `/data/docker`, a separate mount, so even its ~500GB of
+images never touch `/`); and this project's own `logs/` directory is
+6.9MB, with every subprocess temp file and wandb-checkpoint workdir
+landing under `/tmp`, which is its own tmpfs mount (1TB, 13GB used) -
+entirely separate from the 879GB root filesystem, so none of
+`verify_phase3.py`'s retry/subprocess I/O ever contributed to the
+pressure. Summing every root-fs directory readable as a non-root user
+only accounts for ~195GB against `df`'s reported 804GB used - the
+remaining ~600GB sits behind "Permission denied" on other users' home
+directories, most visibly hundreds of `/home/boyuann/tmp/tmp*`
+directories (many tagged `wandb-artifacts`/`wandb-media`) from the same
+user's RL training jobs already identified as saturating GPUs 3/4/6/7.
+No sudo access on this node to get exact figures, but the pattern is
+unambiguous: this is other users' data, not anything this project
+produced or can clean up.
+
 **What this means for Phase 4, revised**: "restart the CARLA server process
 every N trials" would only help if the server itself were accumulating
 state across trials that a restart clears - plausible, but not what this
