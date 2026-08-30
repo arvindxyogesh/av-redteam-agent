@@ -71,6 +71,20 @@ it — these were explicit trade-offs, not guesses.
   This machine already had the nvidia container runtime and CDI GPU devices
   configured, so `docker run --gpus device=N ...` was a straightforward swap
   for the bare `CarlaUE4.sh` invocation. See §4/§5 below.
+  **Update (Phase 3, disk-pressure investigation):** the dead S3 URL above is
+  still dead, but CARLA has since moved 0.9.11 hosting elsewhere - the
+  `tiny.carla.org` shortlinks CARLA's own docs reference
+  (`tiny.carla.org/carla-0-9-11-linux`,
+  `tiny.carla.org/additional-maps-0-9-11-linux`) 308-redirect to a BunnyCDN
+  mirror (`carla-releases.b-cdn.net`) and both returned a clean `200` when
+  checked tonight. Both tarballs are now pre-staged (not extracted) at
+  `/data/savyo/carla-redteam/native_fallback/` as a fallback -
+  `scripts/launch_carla.sh` already supports `CARLA_LAUNCH_MODE=native` for
+  exactly this case. Switching from Docker to native mode is a live option
+  if Docker/root-filesystem pressure (see `docs/evaluator.md`'s §8 root-cause
+  investigation) becomes a recurring problem in Phase 4/6, but that switch
+  has not been made or re-verified - Docker mode remains what's actually
+  tested and in use.
 - **PyTorch: no CUDA build supports the H200 in a Python-3.7 env — fell back
   to CPU inference for Roach's policy net.** Roach's checkpoint loading and
   the CARLA 0.9.11 Python client are both effectively pinned to Python 3.7
