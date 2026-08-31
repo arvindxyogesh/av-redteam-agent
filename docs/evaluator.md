@@ -565,3 +565,54 @@ recommendations above (subprocess-per-trial isolation, retry-with-backoff,
 longer client timeout) stand unchanged; "restart the CARLA server on a
 different/idle GPU" is now specifically ruled out as a fix - the recurring
 crash follows the node's overall load, not the GPU assignment.
+
+#### Disk vs. CPU load, isolated: a third retry under a genuinely quiet node
+
+Two nights after the above, `uptime` briefly showed load average
+**0.12 / 1.15 / 3.63** - a real, order-of-magnitude drop from the 7.6-17
+range that had correlated with every crash so far - while the root
+filesystem was still tight (~22GB free/98%, unchanged from before, not
+better). This was too good a natural experiment to pass up: if disk
+pressure alone is sufficient to cause the crash, it should still happen
+under this condition; if CPU load is the actual trigger, this window
+should let more calls through than before.
+
+Relaunched CARLA on GPU 1 (again confirmed idle beforehand) and ran just
+the 6-call stability loop directly (bypassing a redundant re-run of
+baseline+attacks, whose determinism was already established by the
+GPU-1 confirmation above) via a small standalone script calling
+`run_stability_check()` the same way `verify_phase3.py` does internally.
+
+**Result: call 1/6 and call 2/6 both succeeded** (695.1s/3104 ticks and
+632.5s/3165 ticks respectively - both in the same ballpark as every prior
+successful call) - the first time call 2 has ever survived, across three
+prior attempts on two different GPUs. **Call 3/6 then crashed** with the
+identical uncaught `TimeoutException`. Checked immediately after: load
+average had spiked to **14.63/12.51/9.01** about six minutes before the
+crash (per an `uptime` check at the spike's peak), decaying back down to
+1.78 by the time of the post-crash check; the root filesystem was
+**unchanged** at ~22GB free/98% across the entire run, including both the
+successful calls and the failure.
+
+**This is the cleanest single piece of evidence yet, and it points at CPU
+load specifically, not disk**: disk headroom was constant through both
+outcomes (success and failure), while a load spike is the one variable
+that changed between "two calls succeeded" and "the next one crashed."
+It also rules out any theory tied to a fixed call-index (e.g. "the 2nd
+env always leaks something") - the failure moved from call 2 (both prior
+attempts) to call 3 (this attempt), tracking real-time conditions rather
+than a repeat count. This is correlational, not a controlled proof (no
+load reading exists for the exact ~60s window `load_world()` was hanging
+in), but combined with the earlier bare-client repro's finding that RPC
+calls specifically got slow (not that they failed outright) under
+observed high load, CPU/scheduler contention on this shared node is now
+the best-supported single explanation - disk pressure remains real and
+worth fixing on its own merits, but the evidence no longer suggests it's
+doing the work alone.
+
+**Practical implication for Phase 4, sharpened further**: this node's
+load is bursty, not steadily high - a campaign runner that retries a
+timed-out `run_trial()` after a short backoff (rather than treating one
+timeout as terminal) should ride out these spikes rather than be blocked
+by them, since a quiet window reliably follows within minutes based on
+every observation so far.
