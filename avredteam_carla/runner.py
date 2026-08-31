@@ -35,6 +35,11 @@ class ScenarioConfig:
     route_id: int = 0
     max_steps: int = 6000
     workdir: Optional[str] = None
+    # Phase 4 (docs/search_methods.md Step 2): if set, every search method
+    # samples params for this one attack type only, instead of also
+    # picking an attack type per trial. Phase 5's proper scenario suite may
+    # replace this with something richer; kept minimal for now.
+    fixed_attack_name: Optional[str] = None
 
 
 def _run_episode_kwargs(scenario: ScenarioConfig) -> dict:
