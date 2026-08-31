@@ -72,6 +72,7 @@ def run_trial(
     attack_name: str,
     attack_params: Optional[dict] = None,
     baseline_severity: Optional[float] = None,
+    sanity_frames_dir: Optional[str] = None,
 ) -> Trial:
     """Runs one attacked episode and returns a populated Trial - the call
     a Phase 4 search method makes in a loop: give it an attack name +
@@ -93,6 +94,7 @@ def run_trial(
         **_run_episode_kwargs(scenario),
         attack_name=attack_name,
         attack_params=attack_params or {},
+        sanity_frames_dir=sanity_frames_dir,
     )
     metrics = evaluate(log_dict)
     return Trial(
