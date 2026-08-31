@@ -157,6 +157,28 @@ def test_braking_severity_fields():
     assert m.max_brake_rate > 0
 
 
+def test_max_brake_rate_has_no_effect_on_severity_score():
+    """Phase 4 decisions log: max_brake_rate was never a severity_score
+    term (docs/evaluator.md #7's "Phase 4 note"). Locks in that a swing in
+    max_brake_rate alone, with everything else held fixed, doesn't move
+    severity_score - the exact real-hardware finding that motivated the
+    Phase 4 brief's (moot) "drop it" instruction."""
+    baseline = make_log(
+        steer=[0.0] * 10, brake=[0.0] * 10,
+        lateral_offset_m=[0.0] * 10, lane_half_width_m=[1.75] * 10,
+        nearest_actor_distance_m=[20.0] * 10,
+    )
+    abrupt_brake = make_log(
+        steer=[0.0] * 10, brake=[0.0, 1.0] + [0.0] * 8,  # max_brake_rate spikes to 10.0
+        lateral_offset_m=[0.0] * 10, lane_half_width_m=[1.75] * 10,
+        nearest_actor_distance_m=[20.0] * 10,
+    )
+    m_baseline = evaluate(baseline)
+    m_abrupt = evaluate(abrupt_brake)
+    assert m_abrupt.max_brake_rate > m_baseline.max_brake_rate
+    assert m_abrupt.severity_score == m_baseline.severity_score
+
+
 # ---------------------------------------------------------------------------
 # severity_score
 # ---------------------------------------------------------------------------

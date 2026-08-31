@@ -140,6 +140,13 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Save a clean/attacked BEV PNG pair every N ticks (0 = disabled). Only meaningful with --attack.",
     )
+    p.add_argument(
+        "--sanity-frames-dir",
+        default=None,
+        help="Phase 4 Step 5: if set (with --attack), write start/midpoint/worst-moment "
+        "clean+attacked BEV JPEG pairs here (see avredteam_carla.attacks.sanity_frames). "
+        "Point this under /data/$USER, never a relative path under the repo checkout.",
+    )
     return p.parse_args()
 
 
@@ -270,6 +277,7 @@ def run_episode(
     attack_params: dict = None,
     bev_frames_dir: str = "logs/bev_frames",
     bev_frames_every: int = 0,
+    sanity_frames_dir: str = None,
     debug_dump_info: bool = False,
 ) -> dict:
     """Runs one episode (clean if attack_name is None, attacked otherwise)
@@ -285,6 +293,14 @@ def run_episode(
     these are and why they're computed here rather than read from
     info_dict). Everything else is unchanged from Phase 1/2's verified
     behavior.
+
+    Phase 4 adds sanity_frames_dir (docs/search_methods.md Step 5's visual
+    sanity check): when set (and attack_name is also set), captures
+    start/midpoint/worst-moment BEV frame pairs via
+    avredteam_carla.attacks.sanity_frames.SanityFrameTracker and writes
+    them there as JPEGs at the end of the episode - distinct from
+    bev_frames_dir/bev_frames_every (Phase 2's still-unchanged periodic
+    PNG dump).
     """
     workdir = Path(workdir) if workdir else Path(tempfile.mkdtemp(prefix="roach_run_"))
     workdir.mkdir(parents=True, exist_ok=True)
@@ -361,6 +377,12 @@ def run_episode(
     bev_frames_path = Path(bev_frames_dir) / (attack_name or "none")
     if attack_name and bev_frames_every > 0:
         bev_frames_path.mkdir(parents=True, exist_ok=True)
+
+    sanity_tracker = None
+    if attack_name and sanity_frames_dir:
+        from avredteam_carla.attacks.sanity_frames import SanityFrameTracker
+
+        sanity_tracker = SanityFrameTracker()
 
     try:
         env.set_task_idx(route_id)  # pin an exact route deterministically, no shuffling
@@ -462,6 +484,16 @@ def run_episode(
                 ):
                     _save_bev_frame_pair(hook_handle, bev_frames_path, tick_idx)
 
+                if sanity_tracker is not None and hook_handle.last_attacked_birdview is not None:
+                    sanity_tracker.observe(
+                        tick_idx,
+                        hook_handle.last_clean_birdview,
+                        hook_handle.last_attacked_birdview,
+                        steer=control.steer,
+                        brake=control.brake,
+                        collided_this_tick=bool(events["collision"]),
+                    )
+
                 if done_dict.get(ACTOR_ID):
                     final_episode_event = info_dict[ACTOR_ID].get("episode_event", {})
                     termination_reason = _termination_reason(final_episode_event)
@@ -481,6 +513,10 @@ def run_episode(
                     )
                 else:
                     log.info("Attack hook fired on %d/%d ticks", hook_handle.ticks_patched, len(ticks))
+
+            if sanity_tracker is not None:
+                written = sanity_tracker.finalize(sanity_frames_dir)
+                log.info("Wrote sanity-check frames %s to %s", written, sanity_frames_dir)
 
     finally:
         # Always clean up actors/world state, even on failure. This is what
@@ -532,6 +568,7 @@ def main() -> int:
         attack_params=attack_params,
         bev_frames_dir=args.bev_frames_dir,
         bev_frames_every=args.bev_frames_every,
+        sanity_frames_dir=args.sanity_frames_dir,
         debug_dump_info=args.debug_dump_info,
     )
 

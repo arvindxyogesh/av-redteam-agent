@@ -186,3 +186,81 @@ Phase 4. No scenario suite beyond the single Town01 route — Phase 5.
 - PR titled "Phase 3: Evaluator + campaign runner", acceptance table filled
   in with real Maui results, stability-check and aliasing-check results
   explicitly called out. Do not merge without review.
+
+---
+
+# Phase 4 task brief — Search methods (random search, Bayesian opt, LLM agent)
+
+Following Phase 1-3 (PRs #1-3, unmerged). Adds three search methods that
+all call `run_trial()` in a loop, sharing one interface
+(`SearchMethod.run_campaign()`), so they're directly comparable.
+
+## What was built (see `docs/search_methods.md` for the full writeup)
+
+1. **Step 0, length-normalization — verified, not assumed.** Checked
+   `evaluator.py`'s real code: `max_lateral_offset`/`min_obstacle_clearance`
+   are running max/min over the whole episode, so their length-sensitivity
+   is a mathematical certainty (a min over a longer prefix can only stay
+   equal or decrease), unlike the already rate-normalized `off_lane_frac`/
+   `chattering_rate`. Locked in with unit tests on synthetic data
+   (`tests/test_analyze_episode_length_bias.py`); the real *magnitude* on
+   Phase 3's actual logs needs a real-hardware follow-up (no log files
+   exist in this dev sandbox - gitignored, live only on Maui). No formula
+   change applied yet - `docs/search_methods.md` §0 has the two candidate
+   fixes to test once real magnitude data exists.
+2. **`max_brake_rate` "fix" — checked, turned out to be a no-op.** The
+   brief's instruction to drop it from `severity_score`'s composite
+   assumed it was a term there; checked the real formula first and found
+   it never was (`docs/evaluator.md` #7 already excluded it). No formula
+   change made; documented the check in `docs/evaluator.md` and
+   `docs/search_methods.md` rather than silently "fixing" something that
+   wasn't broken.
+3. `Trial` gains `delta_severity` (the real search objective -
+   `severity_score - baseline_severity`) and `outcome` (`success`/
+   `infra_failure`, so a trial that exhausts its retries is never recorded
+   as `severity_score=0`) - `avredteam_carla/agents/campaign.py`.
+4. `avredteam_carla/agents/search.py` — the shared `SearchMethod`
+   interface + `attack_pool()`/`sample_uniform_params()`/
+   `tunable_params_for()` helpers, reading `ATTACK_REGISTRY`
+   programmatically.
+5. Three search methods, each unit-tested against a stubbed `TrialRunner`
+   (no CARLA needed): `avredteam_carla/agents/random_search.py`,
+   `bayesian_search.py` (Optuna, one TPE study per campaign, attack type
+   as a categorical param - design choice documented in
+   `docs/search_methods.md` §6), `llm_agent_search.py` (Claude tool-use
+   loop, budget enforced both directions, falls back to random sampling
+   if the model stalls/misbehaves - tested against a scripted fake
+   Anthropic client).
+6. Infra hardening, applied to all three methods via one production
+   `TrialRunner`: `avredteam_carla/agents/isolated_runner.py`
+   (subprocess-per-trial via `agents/trial_worker.py`, retry-with-backoff
+   - 3 attempts, 8s/16s/... capped at 60s, matching Phase 3's own proven
+   numbers), `avredteam_carla/preflight.py` (disk/GPU/load snapshot once
+   per campaign + automatic idle-GPU pick), `avredteam_carla/attacks/
+   sanity_frames.py` (3 representative BEV frames per trial via an online
+   doubling/proxy-score heuristic, not a full-episode dump). Failed-trial
+   policy decided: an `infra_failure` trial consumes budget rather than
+   being replaced (bounded worst-case runtime on a node Phase 3 already
+   found bursty).
+7. `avredteam_carla/verify_phase4.py` — runs all three methods on Town01
+   with a small shared budget + fixed seed, checks every output path
+   actually resolves under `/data/$USER` before running. Needs a live
+   CARLA server + `optuna`/`anthropic` installed + `ANTHROPIC_API_KEY` -
+   not runnable in this dev sandbox; the acceptance table needs a
+   real-hardware follow-up, same as every prior phase's real numbers.
+
+## Explicitly out of scope for this phase
+
+No scenario suite beyond Town01/route-0 (Phase 5). No full budget x seed x
+scenario sweep at scale (Phase 6) - this phase proves the three methods
+work end-to-end, Phase 6 is where they run at the scale the paper needs.
+
+## Git workflow
+
+- Branch: `phase-4-search-methods`, cut from the tip of
+  `phase-3-evaluator-campaign-runner`.
+- PR titled "Phase 4: Search methods (random, Bayesian, LLM agent)",
+  acceptance table filled in with real results from a real-hardware
+  follow-up session (Step 0's real length-bias magnitude and Step 6's
+  verification table both need one - see `docs/search_methods.md`). Do
+  not merge without review.

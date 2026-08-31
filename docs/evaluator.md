@@ -218,6 +218,20 @@ Total possible before capping: 40 + 25 + 15 + 10 + 10 = 100 exactly — the
 cap is a safety net for any term interaction, not something expected to
 bind in practice given the per-term caps already sum to 100.
 
+**Phase 4 note: `max_brake_rate` was never a term here.** The Phase 4 brief
+instructed dropping `max_brake_rate` from this composite (citing the real
+finding two sections up — it saturates identically across all four Phase 3
+conditions, unable to discriminate attacked from clean). Checked directly
+against this formula and the real code (`avredteam_carla/evaluator.py`)
+before touching anything: the five terms above are the *complete* formula
+and always have been — `max_brake_rate` was already a supporting-only field
+(this doc's own "`EpisodeMetrics` fields" section already says so), not a
+composite term to remove. The brief's premise didn't hold once checked, so
+no code change was made for this instruction — logging the check itself
+here rather than silently applying a "fix" to something that wasn't
+broken. See `docs/search_methods.md`'s decisions log for the same note in
+Phase 4's own record.
+
 ## `EpisodeMetrics` fields (Step 2)
 
 `chattering_rate, max_steering_jerk, mean_abs_steering_rate,
