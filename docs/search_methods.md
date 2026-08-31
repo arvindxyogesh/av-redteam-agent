@@ -241,13 +241,40 @@ exists anywhere in this project's history (checked, not assumed).
   `claude-sonnet-5` - a sensible present-day default, not a guarantee of
   what's actually available/deployed when this runs for real; confirm
   against the account's available models before a real campaign.
-- The `anthropic` client is injected (`LLMAgentSearch(client=...)`,
-  defaulting to `anthropic.Anthropic()` reading `ANTHROPIC_API_KEY`), so
-  the entire loop - budget accounting, multi-tool-use-per-turn handling,
+- The client is injected (`LLMAgentSearch(client=...)`), so the entire
+  loop - budget accounting, multi-tool-use-per-turn handling,
   malformed-request handling, the stall fallback - is unit-tested end to
   end against a scripted fake client
   (`tests/test_llm_agent_search.py`). No real model call is possible from
   this sandbox.
+
+**Update (real-hardware verification): no `anthropic` SDK version can
+actually run on this project's Python 3.7 - not a missing wheel, a hard
+version floor.** Checked directly rather than assumed: every SDK release
+from 0.27.0 onward (the first with tool-use support) depends on `jiter`,
+and `jiter`'s package metadata declares `Requires-Python: >=3.8` on every
+version ever published, including the first - `pip` refuses to even
+attempt building it, before any compile step runs. Installed a real local
+Rust toolchain (`rustup`, user-level, no sudo) specifically to rule out
+"just no prebuilt wheel for this platform" as the cause; it made no
+difference, confirming the declared `Requires-Python` floor is the actual
+blocker. The only cp37-installable `anthropic` version, 0.26.0, predates
+the `tools` parameter on `messages.create()` entirely (confirmed via
+`inspect.signature`). **Decision (this option chosen over a two-environment
+split or deferring Step 4's real run - see the PR discussion): the default
+client is now `avredteam_carla.agents.anthropic_http_client.AnthropicHTTPClient`**,
+a small hand-written client hitting the same
+`https://api.anthropic.com/v1/messages` REST endpoint directly via `httpx`
+(pure Python, already an `anthropic==0.26.0` transitive dependency, cp37-
+compatible), exposing just the `.messages.create(...)` surface
+`LLMAgentSearch` uses - no other line of `llm_agent_search.py` needed to
+change beyond the default-client factory. Unit-tested against
+`httpx.MockTransport` (`tests/test_anthropic_http_client.py`) - request
+shape, response-block attribute access, the response-content-fed-back-into-
+the-next-request round-trip `LLMAgentSearch`'s loop actually does, and
+retry behavior on 429/5xx vs. immediate-raise on other 4xx. Trade-off
+accepted knowingly: no SDK-provided auto-retry/error-taxonomy/streaming -
+this shim only implements what `LLMAgentSearch` actually calls.
 
 ## 8. Infrastructure hardening (Step 5) - applies to all three methods
 

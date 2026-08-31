@@ -115,10 +115,13 @@ class LLMAgentSearch(SearchMethod):
     name = "llm_agent"
 
     def __init__(self, client=None, model: str = DEFAULT_MODEL, max_tokens: int = 1024):
-        # client defaults to a real anthropic.Anthropic() (reads
-        # ANTHROPIC_API_KEY from the environment), so a real campaign needs
-        # no wiring beyond that env var. Tests inject a stub exposing the
-        # same `.messages.create(...)` surface, never touching the network.
+        # client defaults to AnthropicHTTPClient() (reads ANTHROPIC_API_KEY
+        # from the environment), so a real campaign needs no wiring beyond
+        # that env var. Tests inject a stub exposing the same
+        # `.messages.create(...)` surface, never touching the network.
+        # Not anthropic.Anthropic() - see anthropic_http_client.py's module
+        # docstring for why: no anthropic SDK version that supports tool
+        # use can be installed under this project's pinned Python 3.7.
         self._client = client
         self._model = model
         self._max_tokens = max_tokens
@@ -126,9 +129,9 @@ class LLMAgentSearch(SearchMethod):
     def _client_or_default(self):
         if self._client is not None:
             return self._client
-        import anthropic
+        from avredteam_carla.agents.anthropic_http_client import AnthropicHTTPClient
 
-        return anthropic.Anthropic()
+        return AnthropicHTTPClient()
 
     def run_campaign(
         self,
