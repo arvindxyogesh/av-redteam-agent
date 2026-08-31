@@ -71,15 +71,60 @@ testing once real magnitude data exists (not applied, not yet chosen):
 - Compute the extrema over a fixed time window (e.g. the first 60s) rather
   than the whole variable-length episode.
 
-**Concrete next step for a real-hardware session**: run
-`python -m avredteam_carla.analyze_episode_length_bias --log <baseline.json> --log <channel_noise.json> --log <geometry_spoof.json> --log <phantom_actor.json> --out logs/phase4_length_bias.json`
-against Phase 3's real logs (rerun `verify_phase3.py` first if they
-weren't kept on disk), read off the real `min_obstacle_clearance`/
-`max_lateral_offset` correlation-with-length numbers from the printed
-table, and only then decide whether the magnitude is large enough to
-justify one of the two candidate fixes above (or a different one) -
-getting sign-off before applying it project-wide, per the original
-instruction, since a wrong fix here propagates through Phases 5-6.
+**Update (real-hardware verification): magnitude measured, and it's real
+but currently inert.** Ran `analyze_episode_length_bias` against four
+freshly-regenerated real logs (baseline 3998 ticks, channel_noise 2682,
+geometry_spoof 1355, phantom_actor 2676 - Phase 3's own logs weren't kept
+on disk, gitignored per `.gitignore`, so these are new runs against the
+same scenario/attack params, not a reuse of Phase 3's exact episode):
+
+| Condition | chattering_rate | mean_abs_steering_rate | max_lateral_offset | off_lane_frac | min_obstacle_clearance | severity_score |
+|---|---|---|---|---|---|---|
+| baseline | -0.24 | 0.39 | 0.78 | 0.74 | -0.89 | 0.53 |
+| channel_noise | -0.44 | 0.51 | 0.82 | n/a (constant 0) | -0.78 | 0.74 |
+| geometry_spoof | 0.64 | -0.72 | 0.80 | 0.83 | -0.64 | 0.78 |
+| phantom_actor | 0.19 | 0.66 | 0.78 | 0.74 | -0.78 | 0.36 |
+
+The predicted structural bias holds exactly as argued: `max_lateral_offset`
+correlates positively and `min_obstacle_clearance` negatively with
+`n_ticks` in every single condition, no exceptions - confirmed
+monotonic on inspection of the raw prefix rows, not just the correlation
+coefficient. `severity_score` itself also correlates with length in all
+four (0.36-0.78) - real, not a curiosity.
+
+**But checking where that flows through `severity_score`'s actual formula
+(`docs/evaluator.md` #7) changes the practical conclusion**:
+`min_obstacle_clearance` only enters via
+`min(10, max(0, 2 - min_obstacle_clearance) * 5)`, and every observed
+`min_obstacle_clearance` across all four real runs stayed above 2.3m - so
+`max(0, 2 - clearance)` clamped to **exactly 0 in every run**. This
+field's length-sensitivity, while mathematically real, has had **zero
+actual effect on any real `severity_score` computed so far.**
+`max_lateral_offset` isn't in the formula at all. The one length-sensitive
+field that *is* in the formula, `off_lane_frac`, turns out on inspection
+of the raw prefix rows to not be a smooth drift in three of four
+conditions - it's a one-time step from 0 to its final value at the *very
+last* prefix point in baseline (0→0.228) and phantom_actor (0→0.008), and
+an early-saturating ceiling in geometry_spoof (0.78 by the first prefix,
+0.98 by the last). Translated into `severity_score` points
+(`min(15, off_lane_frac * 15)`), the actual swing across an episode's full
+length-vs-shortest-prefix range is ≈3.4 points (baseline), ≈0.1 (phantom_actor),
+≈3.0 (geometry_spoof) - out of 100.
+
+**Decision: no normalization fix applied.** Real measured impact on every
+`severity_score` seen so far is zero (`min_obstacle_clearance`, clamped
+inactive) or a few points out of 100 (`off_lane_frac`'s late-episode
+step), not the systematic distortion that would justify the complexity
+and Phase-5/6-propagation risk of either candidate fix from above. This
+isn't "the bias doesn't exist" (it provably does, in `max_lateral_offset`/
+`min_obstacle_clearance`'s raw values) - it's that the parts of
+`severity_score` a search method's `delta_severity` objective actually
+sees haven't been pushed into the range where it matters, in any real run
+to date. **Revisit if this stops holding**: specifically, a future
+campaign trial with `min_obstacle_clearance` dipping below 2m (a genuine
+near-miss, unlike anything seen here) would activate the clamped term for
+the first time and is worth re-running this same analysis against when it
+happens, rather than assuming today's "inert" finding generalizes forever.
 
 ## 1. `max_brake_rate` "fix" — checked, turned out to be a no-op
 
