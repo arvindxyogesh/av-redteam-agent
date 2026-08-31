@@ -62,10 +62,26 @@ def run_baseline(scenario: ScenarioConfig) -> EpisodeMetrics:
     return evaluate(log_dict)
 
 
-def run_trial(scenario: ScenarioConfig, attack_name: str, attack_params: Optional[dict] = None) -> Trial:
+def run_trial(
+    scenario: ScenarioConfig,
+    attack_name: str,
+    attack_params: Optional[dict] = None,
+    baseline_severity: Optional[float] = None,
+) -> Trial:
     """Runs one attacked episode and returns a populated Trial - the call
     a Phase 4 search method makes in a loop: give it an attack name +
-    params, get back structured metrics to decide what to try next."""
+    params, get back structured metrics to decide what to try next.
+
+    baseline_severity (Phase 4): the scenario's baseline severity_score
+    (from run_baseline()), so the returned Trial carries delta_severity -
+    the quantity every Phase 4 search method actually optimizes against
+    (docs/search_methods.md "Optimize against delta severity, not raw").
+    A caller running many trials against the same scenario should call
+    run_baseline() once and pass its severity_score here on every
+    run_trial() call, rather than re-running the baseline per trial.
+    Optional (default None) to keep this call byte-for-byte compatible with
+    Phase 3 callers (verify_phase3.py) that don't need delta_severity.
+    """
     from avredteam_carla.run_clean_episode import run_episode
 
     log_dict = run_episode(
@@ -79,4 +95,5 @@ def run_trial(scenario: ScenarioConfig, attack_name: str, attack_params: Optiona
         attack_name=attack_name,
         attack_params=dict(attack_params or {}),
         metrics=metrics,
+        baseline_severity=baseline_severity,
     )

@@ -135,6 +135,11 @@ def evaluate(log: dict) -> EpisodeMetrics:
     off_lane_term = off_lane_frac if off_lane_frac is not None else 0.0
     clearance_term = min_obstacle_clearance if min_obstacle_clearance is not None else float("inf")
 
+    # max_brake_rate has never had a term here - see docs/evaluator.md #7
+    # ("Total possible before capping: 40+25+15+10+10=100", already
+    # excluding it) and the Phase 4 decisions log for why the Phase 4 brief's
+    # "drop it from the composite" instruction turned out to be a no-op once
+    # checked against this actual formula.
     severity_score = (
         (40.0 if collided else 0.0)
         + min(25.0, chattering_rate * 25.0)
